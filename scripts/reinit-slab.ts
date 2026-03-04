@@ -84,6 +84,19 @@ const FORCE = args["force"] ?? false;
 const ENGINE_OFF = 640;              // align_up(HEADER_LEN=104 + CONFIG_LEN=536, 8) — see slab.ts:441
 const ENGINE_MARK_PRICE_OFF = 400;   // u64 mark_price_e6 within engine section — see slab.ts:457
 
+// Runtime guard: ensure mark-price read stays within plausible slab bounds.
+// If slab.ts changes ENGINE_OFF or ENGINE_MARK_PRICE_OFF, update these constants
+// and bump the assertion so the script fails fast rather than reading garbage.
+function assertEngineOffsets(dataLen: number): void {
+  const minSlabSize = ENGINE_OFF + ENGINE_MARK_PRICE_OFF + 8; // 8 bytes for u64
+  if (dataLen < minSlabSize) {
+    throw new Error(
+      `Slab account too small (${dataLen} bytes). Expected >= ${minSlabSize}. ` +
+      `ENGINE_OFF (${ENGINE_OFF}) + ENGINE_MARK_PRICE_OFF (${ENGINE_MARK_PRICE_OFF}) may be out of sync with slab.ts.`
+    );
+  }
+}
+
 function readU64LE(data: Uint8Array, off: number): bigint {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   return view.getBigUint64(off, true);
@@ -265,6 +278,9 @@ async function main() {
   } catch (e) {
     throw new Error(`Failed to parse slab params: ${e}. Cannot safely reinit.`);
   }
+
+  // Validate engine offsets before reading raw bytes
+  assertEngineOffsets(data.length);
 
   // Read mark price directly (not exported by parseEngine return value)
   const markPriceE6 = readU64LE(data, ENGINE_OFF + ENGINE_MARK_PRICE_OFF);
