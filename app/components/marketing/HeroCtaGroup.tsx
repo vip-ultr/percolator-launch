@@ -43,7 +43,7 @@ export function HeroCtaGroup() {
 
       <Link
         href="/markets"
-        className={`hero-cta group inline-flex items-center gap-2 border-[1.5px] border-white/20 bg-white/[0.06] px-6 py-3 text-[15px] font-semibold text-white rounded-lg transition-all duration-150 hover:border-white/35 hover:bg-white/[0.10] ${prefersReduced ? '' : 'gsap-fade'}`}
+        className={`hero-cta group inline-flex items-center gap-2 border-[1.5px] border-white/20 bg-white/[0.06] px-6 py-3 text-[15px] font-semibold text-white transition-all duration-150 hover:border-white/35 hover:bg-white/[0.10] ${prefersReduced ? '' : 'gsap-fade'}`}
       >
         Trade Now
         <svg
