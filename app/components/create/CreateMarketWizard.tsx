@@ -33,10 +33,12 @@ interface WizardState {
   tokenMeta: { name: string; symbol: string; decimals: number } | null;
   walletBalance: bigint | null;
   // Step 2
-  oracleType: "pyth" | "hyperp_ema" | "admin";
+  oracleType: "pyth" | "hyperp_ema" | "admin" | "pumpswap";
   oracleFeed: string;
   dexPool: DexPoolResult | null;
   pythFeed: { id: string; name: string } | null;
+  /** PumpSwap pool address (base58) when oracleType === "pumpswap" */
+  pumpswapPool: string | null;
   // Step 3
   slabTier: SlabTierKey;
   tradingFeeBps: number;
@@ -56,6 +58,7 @@ const DEFAULT_STATE: WizardState = {
   oracleFeed: "",
   dexPool: null,
   pythFeed: null,
+  pumpswapPool: null,
   // Quick mode defaults to small — cheapest tier for quick testing.
   // Manual mode users can choose their own tier (defaults to large in the picker).
   slabTier: "small",
@@ -130,6 +133,14 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
     if (wizard.oracleType === "admin") return true;
     if (wizard.oracleType === "pyth") return isValidHex64(wizard.oracleFeed);
     if (wizard.oracleType === "hyperp_ema") return isValidBase58Pubkey(wizard.oracleFeed);
+    // SECURITY (LOW): also require a valid DEX price for pumpswap mode.
+    // If DexScreener returned no priceUsd, the initial mark would default to $0 and the
+    // first KeeperCrank may behave unexpectedly. Guard here to surface a clear UX error
+    // rather than silently creating a market with a zero initial mark.
+    if (wizard.oracleType === "pumpswap")
+      return wizard.pumpswapPool !== null
+        && isValidBase58Pubkey(wizard.pumpswapPool)
+        && (wizard.dexPool?.priceUsd ?? 0) > 0;
     return false;
   })();
   const step3Valid =
@@ -214,6 +225,17 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
           ...base,
           oracleType: "pyth" as const,
           oracleFeed: quickLaunch.pythFeedId,
+          pumpswapPool: null,
+          adminPrice: quickLaunch.adminPrice,
+        };
+      }
+      if (quickLaunch.oracleType === "pumpswap" && quickLaunch.pumpswapPool) {
+        // PumpSwap mode: permissionless, program reads pool reserves directly
+        return {
+          ...base,
+          oracleType: "pumpswap" as const,
+          oracleFeed: "",
+          pumpswapPool: quickLaunch.pumpswapPool,
           adminPrice: quickLaunch.adminPrice,
         };
       }
@@ -222,6 +244,7 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
         ...base,
         oracleType: "admin" as const,
         oracleFeed: "",
+        pumpswapPool: null,
         adminPrice: quickLaunch.adminPrice,
       };
     });
@@ -326,6 +349,19 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
         return { oracleFeed: "0".repeat(64), priceE6: 1_000_000n };
       }
     }
+    if (wizard.oracleType === "pumpswap" && wizard.pumpswapPool) {
+      // PumpSwap mode: indexFeedId = pool pubkey bytes as hex64
+      // oracle_authority = zeros (permissionless)
+      try {
+        const pk = new PublicKey(wizard.pumpswapPool);
+        const hex = Array.from(pk.toBytes())
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+        return { oracleFeed: hex, priceE6: 0n };
+      } catch {
+        return { oracleFeed: "0".repeat(64), priceE6: 1_000_000n };
+      }
+    }
     // Admin oracle
     const price = parseFloat(wizard.adminPrice ?? "1");
     const priceE6 = BigInt(Math.round((isNaN(price) ? 1 : price) * 1_000_000));
@@ -355,6 +391,7 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       name: wizard.tokenMeta?.name ?? "Unknown Token",
       decimals,
       mainnetCA: wizard.mintAddress !== effectiveMint ? wizard.mintAddress : undefined,
+      pumpswapPool: wizard.oracleType === "pumpswap" ? (wizard.pumpswapPool ?? undefined) : undefined,
     };
     create(params);
   };
@@ -381,6 +418,7 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       name: wizard.tokenMeta?.name ?? "Unknown Token",
       decimals,
       mainnetCA: wizard.mintAddress !== effectiveMint ? wizard.mintAddress : undefined,
+      pumpswapPool: wizard.oracleType === "pumpswap" ? (wizard.pumpswapPool ?? undefined) : undefined,
     };
     create(params, createState.step);
   };

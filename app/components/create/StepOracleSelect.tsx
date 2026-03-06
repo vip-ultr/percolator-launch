@@ -12,7 +12,7 @@ interface StepOracleSelectProps {
   mintValid: boolean;
   tokenSymbol: string | null;
   mode: "quick" | "manual";
-  oracleType: "pyth" | "hyperp_ema" | "admin";
+  oracleType: "pyth" | "hyperp_ema" | "admin" | "pumpswap";
   onOracleTypeChange: (type: "pyth" | "hyperp_ema" | "admin") => void;
   oracleFeed: string;
   onOracleFeedChange: (feed: string) => void;

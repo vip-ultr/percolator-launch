@@ -14,7 +14,7 @@ interface StepReviewProps {
   tokenDecimals: number;
   priceUsd?: number;
   // Oracle
-  oracleType: "pyth" | "hyperp_ema" | "admin";
+  oracleType: "pyth" | "hyperp_ema" | "admin" | "pumpswap";
   oracleLabel: string;
   // Parameters
   slabTier: SlabTierKey;

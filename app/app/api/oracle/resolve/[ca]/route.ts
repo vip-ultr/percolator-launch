@@ -91,6 +91,8 @@ interface OracleResolveResult {
   symbol: string;
   price: number;
   source: "pyth" | "jupiter" | "dexscreener" | "unknown";
+  /** PumpSwap pool address (base58) when the best price source is PumpSwap DEX. Null otherwise. */
+  pumpswapPool: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +138,7 @@ async function fetchJupiterPrice(
 
 async function fetchDexScreenerInfo(
   ca: string,
-): Promise<{ price: number; symbol: string | null } | null> {
+): Promise<{ price: number; symbol: string | null; pumpswapPool: string | null } | null> {
   try {
     const resp = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, {
       signal: AbortSignal.timeout(6000),
@@ -149,6 +151,8 @@ async function fetchDexScreenerInfo(
       baseToken?: { symbol?: string };
       liquidity?: { usd?: number };
       chainId?: string;
+      dexId?: string;
+      pairAddress?: string;
     }>;
     if (!pairs?.length) return null;
 
@@ -162,7 +166,15 @@ async function fetchDexScreenerInfo(
     const price = parseFloat(best.priceUsd ?? "0");
     if (!isFinite(price) || price <= 0) return null;
 
-    return { price, symbol: best.baseToken?.symbol ?? null };
+    // Extract PumpSwap pool address if the best pair is on PumpSwap.
+    // SECURITY (MEDIUM #1): validate pairAddress is a valid Solana base58 pubkey before
+    // returning it. DexScreener's pairAddress is user-controlled data — an invalid address
+    // would cause new PublicKey() to throw in the frontend/hooks without a try/catch.
+    const rawPoolAddr =
+      best.dexId === "pumpswap" && best.pairAddress ? best.pairAddress : null;
+    const pumpswapPool = rawPoolAddr && isValidBase58Pubkey(rawPoolAddr) ? rawPoolAddr : null;
+
+    return { price, symbol: best.baseToken?.symbol ?? null, pumpswapPool };
   } catch {
     return null;
   }
@@ -222,20 +234,24 @@ export async function GET(
       symbol: pythEntry.symbol,
       price,
       source: "pyth",
-    };
-  } else if (jupResult) {
-    result = {
-      feedId: null,
-      symbol: symbolFromPrice ?? ca.slice(0, 6),
-      price: jupResult.price,
-      source: "jupiter",
+      pumpswapPool: null,
     };
   } else if (dexResult) {
+    // Prefer DexScreener first for non-Pyth tokens: it returns pumpswapPool address
     result = {
       feedId: null,
       symbol: symbolFromPrice ?? ca.slice(0, 6),
       price: dexResult.price,
       source: "dexscreener",
+      pumpswapPool: dexResult.pumpswapPool,
+    };
+  } else if (jupResult) {
+    result = {
+      feedId: null,
+      symbol: jupResult.symbol ?? ca.slice(0, 6),
+      price: jupResult.price,
+      source: "jupiter",
+      pumpswapPool: null,
     };
   } else {
     // No price found anywhere
