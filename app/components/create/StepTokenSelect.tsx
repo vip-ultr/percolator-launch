@@ -79,12 +79,8 @@ export const StepTokenSelect: FC<StepTokenSelectProps> = ({
       onMintNetworkValidChange?.(false);
       return;
     }
-    // Devnet: accept any valid pubkey — mirror endpoint handles devnet mint creation
-    if (isDevnet) {
-      setMintNetworkStatus("valid");
-      onMintNetworkValidChange?.(true);
-      return;
-    }
+    // Devnet: do NOT early-return — fall through to getAccountInfo + mirror-mint flow
+    // so that devnetMintAddress gets resolved via onDevnetMintResolved callback.
     let cancelled = false;
     setMintNetworkStatus("loading");
     setMirrorError(null);
