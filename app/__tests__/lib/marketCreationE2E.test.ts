@@ -100,67 +100,99 @@ describe("Market Creation — Failure Scenarios", () => {
   });
 
   describe("Program error flows", () => {
-    it("handles already-initialized market (code 0x0)", () => {
+    it("handles invalid magic bytes (code 0x0)", () => {
       const msg = parseMarketCreationError(
         new Error("custom program error: 0x0")
+      );
+      expect(msg).toContain("Invalid magic bytes");
+    });
+
+    it("handles invalid program version (code 0x1)", () => {
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0x1")
+      );
+      expect(msg).toContain("Invalid program version");
+    });
+
+    it("handles already-initialized market (code 0x2)", () => {
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0x2")
       );
       expect(msg).toContain("already initialized");
     });
 
-    it("handles uninitialized market (code 0x1)", () => {
-      const msg = parseMarketCreationError(
-        new Error("custom program error: 0x1")
-      );
-      expect(msg).toContain("not initialized");
-    });
-
-    it("handles invalid slab length (code 0x2)", () => {
-      const msg = parseMarketCreationError(
-        new Error("custom program error: 0x2")
-      );
-      expect(msg).toContain("slab length");
-    });
-
-    it("handles insufficient balance in program (code 0x4)", () => {
+    it("handles invalid slab length (code 0x4)", () => {
       const msg = parseMarketCreationError(
         new Error("custom program error: 0x4")
       );
-      expect(msg).toContain("Insufficient balance");
+      expect(msg).toContain("Invalid slab length");
     });
 
-    it("handles math overflow (code 0x5)", () => {
+    it("handles invalid oracle key (code 0x5)", () => {
       const msg = parseMarketCreationError(
         new Error("custom program error: 0x5")
       );
-      expect(msg).toContain("overflow");
+      expect(msg).toContain("Invalid oracle key");
     });
 
-    it("handles margin requirement not met (code 0x6)", () => {
+    it("handles stale oracle price (code 0x6)", () => {
       const msg = parseMarketCreationError(
         new Error("custom program error: 0x6")
       );
-      expect(msg).toContain("Margin requirement");
+      expect(msg).toContain("Oracle price is stale");
     });
 
-    it("handles insufficient seed deposit (code 0x8)", () => {
+    it("handles invalid vault ATA (code 0x8)", () => {
       const msg = parseMarketCreationError(
         new Error("custom program error: 0x8")
+      );
+      expect(msg).toContain("Invalid vault ATA");
+    });
+
+    it("handles invalid mint (code 0x9)", () => {
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0x9")
+      );
+      expect(msg).toContain("Invalid mint");
+    });
+
+    it("handles expected signer (code 0xA)", () => {
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0xA")
+      );
+      expect(msg).toContain("Expected a signer");
+    });
+
+    it("handles insufficient seed deposit (code 0x24)", () => {
+      // 0x24 = 36 decimal
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0x24")
       );
       expect(msg).toContain("seed deposit");
     });
 
-    it("handles market paused (code 0x9)", () => {
+    it("handles market paused (code 0x21)", () => {
+      // 0x21 = 33 decimal
       const msg = parseMarketCreationError(
-        new Error("custom program error: 0x9")
+        new Error("custom program error: 0x21")
       );
       expect(msg).toContain("paused");
     });
 
-    it("handles stale oracle price (code 0xA)", () => {
+    it("handles math overflow (code 0x12)", () => {
+      // 0x12 = 18 decimal
       const msg = parseMarketCreationError(
-        new Error("custom program error: 0xA")
+        new Error("custom program error: 0x12")
       );
-      expect(msg).toContain("Oracle price");
+      expect(msg).toContain("overflow");
+    });
+
+    it("handles insufficient balance (code 0xD)", () => {
+      // 0xD = 13 decimal
+      const msg = parseMarketCreationError(
+        new Error("custom program error: 0xD")
+      );
+      expect(msg).toContain("Insufficient balance");
     });
 
     it("handles unknown program error code", () => {
@@ -173,7 +205,7 @@ describe("Market Creation — Failure Scenarios", () => {
 
     it("handles InstructionError format", () => {
       const msg = parseMarketCreationError(
-        new Error('InstructionError: [2, { Custom: 8 }]')
+        new Error('InstructionError: [2, { Custom: 36 }]')
       );
       expect(msg).toContain("seed deposit");
     });
