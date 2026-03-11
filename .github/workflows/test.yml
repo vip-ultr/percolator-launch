@@ -143,6 +143,8 @@ jobs:
       # otherwise fall back to a 25-char placeholder so the server starts in CI.
       NEXT_PUBLIC_PRIVY_APP_ID: ${{ secrets.NEXT_PUBLIC_PRIVY_APP_ID || 'cltestappid00000000000000' }}
       NEXT_PUBLIC_DEFAULT_NETWORK: devnet
+      # Required by next.config.ts validation — use a dummy URL in CI
+      NEXT_PUBLIC_API_URL: http://localhost:4000
     
     steps:
       - name: Checkout code
@@ -304,6 +306,9 @@ jobs:
     name: Type Check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # Required by next.config.ts validation — use a dummy URL in CI
+      NEXT_PUBLIC_API_URL: http://localhost:4000
     
     steps:
       - name: Checkout code
