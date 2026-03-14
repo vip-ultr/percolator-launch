@@ -118,6 +118,10 @@ export class StatsCollector {
           const oracleAuthority = market.config.oracleAuthority.toBase58();
           const priceE6 = Number(market.config.authorityPriceE6);
           const initialMarginBps = Number(market.params.initialMarginBps);
+          if (!initialMarginBps || initialMarginBps <= 0) {
+            logger.warn("Skipping market with invalid initialMarginBps — slab may be uninitialized", { slabAddress, initialMarginBps });
+            continue;
+          }
           const maxLeverage = Math.floor(10000 / initialMarginBps);
           
           // Try to resolve token metadata from on-chain (Helius DAS / Metaplex)
