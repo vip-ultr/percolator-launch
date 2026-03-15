@@ -185,7 +185,9 @@ app.onError((err, c) => {
 
 // Validate NODE_ENV at startup
 const validNodeEnvs = ["production", "development", "test"];
-if (process.env.NODE_ENV && !validNodeEnvs.includes(process.env.NODE_ENV)) {
+if (!process.env.NODE_ENV) {
+  logger.warn("NODE_ENV is not set — defaulting to development behaviour");
+} else if (!validNodeEnvs.includes(process.env.NODE_ENV)) {
   logger.error("Invalid NODE_ENV configuration", {
     nodeEnv: process.env.NODE_ENV,
     validOptions: validNodeEnvs.join(", ")
@@ -200,11 +202,20 @@ async function verifyDatabaseConnection(): Promise<void> {
   try {
     logger.info("Verifying database connectivity...");
     
-    // Query markets table to verify connection
-    const { count, error } = await getSupabase()
-      .from("markets")
-      .select("id", { count: "exact", head: true });
-    
+    // Query markets table to verify connection (5s timeout to avoid hanging startup)
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), 5000);
+    let count: number | null;
+    let error: unknown;
+    try {
+      ({ count, error } = await getSupabase()
+        .from("markets")
+        .select("id", { count: "exact", head: true })
+        .abortSignal(controller.signal));
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+
     if (error) {
       throw error;
     }
