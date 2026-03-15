@@ -229,15 +229,11 @@ async function verifyDatabaseConnection(): Promise<void> {
       supabaseKey: process.env.SUPABASE_KEY ? "configured" : "not configured"
     });
     
-    // Send critical alert
-    try {
-      await sendCriticalAlert("API startup failed: Database connection failed", [
-        { name: "Error", value: errorMsg.slice(0, 200), inline: false },
-        { name: "Reason", value: "API cannot start without database connectivity", inline: false },
-      ]);
-    } catch (alertErr) {
-      logger.error("Failed to send critical alert", { error: alertErr });
-    }
+    // Send critical alert (sendCriticalAlert swallows its own failures internally)
+    await sendCriticalAlert("API startup failed: Database connection failed", [
+      { name: "Error", value: errorMsg.slice(0, 200), inline: false },
+      { name: "Reason", value: "API cannot start without database connectivity", inline: false },
+    ]);
     
     process.exit(1);
   }

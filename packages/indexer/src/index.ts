@@ -89,7 +89,9 @@ setInterval(async () => {
 async function start() {
   // Validate NODE_ENV at startup
   const validNodeEnvs = ["production", "development", "test"];
-  if (process.env.NODE_ENV && !validNodeEnvs.includes(process.env.NODE_ENV)) {
+  if (!process.env.NODE_ENV) {
+    logger.warn("NODE_ENV is not set — defaulting to development behaviour");
+  } else if (!validNodeEnvs.includes(process.env.NODE_ENV)) {
     logger.error("Invalid NODE_ENV configuration", {
       nodeEnv: process.env.NODE_ENV,
       validOptions: validNodeEnvs.join(", ")
