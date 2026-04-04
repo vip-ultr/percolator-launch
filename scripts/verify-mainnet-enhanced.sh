@@ -40,6 +40,32 @@ for arg in "$@"; do
   esac
 done
 
+# Run trade flow test if requested
+run_trade_test() {
+  echo "${BLUE}Trade Flow Verification${NC}"
+
+  # Check if e2e-open-close-position.ts script exists
+  if [[ ! -f "scripts/e2e-open-close-position.ts" ]]; then
+    warn "Trade test" "e2e-open-close-position.ts not found"
+    return 1
+  fi
+
+  # Check if deployer keypair is available
+  if [[ ! -f "/tmp/deployer.json" ]]; then
+    warn "Trade test" "Deployer keypair not found at /tmp/deployer.json"
+    return 1
+  fi
+
+  # Run the trade test
+  if npx tsx scripts/e2e-open-close-position.ts &>/dev/null; then
+    pass "Trade flow" "End-to-end trade test passed"
+    return 0
+  else
+    fail "Trade flow" "End-to-end trade test failed"
+    return 1
+  fi
+}
+
 # Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -134,15 +160,15 @@ check_market_network_isolation() {
   fi
 }
 
-# Check oracle prices are active
+# Check oracle prices are active (using index_price field)
 check_oracle_prices() {
   local url="$API_URL/api/markets"
   local body active_oracle stale_oracle
   body=$(curl -s --max-time 10 "$url" 2>/dev/null || echo "[]")
 
-  # Count markets with active oracle prices
-  active_oracle=$(echo "$body" | jq '[.[] | select(.oracle_price != null and .oracle_price > 0)] | length' 2>/dev/null || echo "0")
-  stale_oracle=$(echo "$body" | jq '[.[] | select(.oracle_price == null or .oracle_price == 0)] | length' 2>/dev/null || echo "0")
+  # Count markets with active index prices (primary oracle field)
+  active_oracle=$(echo "$body" | jq '[.[] | select(.index_price != null and .index_price > 0)] | length' 2>/dev/null || echo "0")
+  stale_oracle=$(echo "$body" | jq '[.[] | select(.index_price == null or .index_price == 0)] | length' 2>/dev/null || echo "0")
 
   if [[ "$active_oracle" -gt 0 ]]; then
     pass "Oracle prices" "$active_oracle markets with active prices"
@@ -157,11 +183,11 @@ check_oracle_prices() {
 
 # Check auth is required on protected endpoints
 check_auth_guards() {
-  local url="$API_URL/api/admin/stats"
+  local url="$API_URL/api/admin/bugs"
   local status
-  status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$url" \
+  status=$(curl -s -o /dev/null -w "%{http_code}" -X GET "$url" \
     -H "Content-Type: application/json" \
-    -d '{}' --max-time 5 2>/dev/null || echo "000")
+    --max-time 5 2>/dev/null || echo "000")
 
   if [[ "$status" == "401" || "$status" == "403" ]]; then
     pass "Auth guards" "Admin endpoints require authentication (HTTP $status)"
@@ -178,9 +204,11 @@ check_cors_headers() {
   cors_methods=$(curl -s -i --max-time 5 "$url" 2>/dev/null | grep -i "access-control-allow-methods" | head -1 || echo "")
 
   if [[ -z "$cors_origin" ]]; then
-    pass "CORS headers" "No wildcard CORS — same-origin policy enforced"
+    pass "CORS headers" "No CORS header present"
+  elif echo "$cors_origin" | grep -qi '\*'; then
+    fail "CORS headers" "Wildcard CORS detected: ${cors_origin:0:80}"
   else
-    warn "CORS headers" "CORS header present: ${cors_origin:0:80}"
+    pass "CORS headers" "Restricted CORS origin configured: ${cors_origin:0:80}"
   fi
 }
 
@@ -254,6 +282,13 @@ echo ""
 echo "${BLUE}5. WebSocket Connectivity${NC}"
 check_websocket
 echo ""
+
+# --- 6. Trade Flow Test (optional) ---
+if [[ $INCLUDE_TRADE_TEST -eq 1 ]]; then
+  echo "${BLUE}6. Trade Flow Test${NC}"
+  run_trade_test || exit 1
+  echo ""
+fi
 
 # --- Summary ---
 echo "╔════════════════════════════════════════════════════════════╗"
