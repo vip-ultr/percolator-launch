@@ -18,7 +18,9 @@ import { getClientIp } from "@/lib/get-client-ip";
 
 export const dynamic = "force-dynamic";
 
-const NETWORK = process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim() ?? "mainnet";
+const NETWORK =
+  process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim() ??
+  process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim();
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 20;
 const requestCounts = new Map<string, { count: number; resetAt: number }>();
@@ -108,7 +110,7 @@ export async function POST(req: NextRequest) {
 
     // Upsert: use mintAddress as both mainnet_ca and devnet_mint for native devnet mints.
     // This allows devnet-airdrop to look up by devnet_mint and find the row.
-    const { error } = await (supabase as any).from("devnet_mints").upsert(
+    const { error } = await supabase.from("devnet_mints").upsert(
       {
         mainnet_ca: mintAddress, // self-referencing for devnet-native mints
         devnet_mint: mintAddress,

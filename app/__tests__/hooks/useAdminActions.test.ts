@@ -46,8 +46,8 @@ vi.mock("@/hooks/useWalletCompat", () => ({
 vi.mock("@/lib/tx", () => ({
   sendTx: vi.fn().mockResolvedValue({ signature: "abc123" }),
 }));
-vi.mock("@percolator/sdk", async () => {
-  const actual = await vi.importActual("@percolator/sdk");
+vi.mock("@percolatorct/sdk", async () => {
+  const actual = await vi.importActual("@percolatorct/sdk");
   return {
     ...actual,
     encodeSetOracleAuthority: vi.fn(() => Buffer.from([])),
@@ -71,7 +71,7 @@ import { renderHook } from "@testing-library/react";
 import { useAdminActions } from "@/hooks/useAdminActions";
 
 function mockWallet(pubkey: PublicKey) {
-  (useWalletCompat as any).mockReturnValue({
+  vi.mocked(useWalletCompat).mockReturnValue({
     publicKey: pubkey,
     signTransaction: vi.fn(),
   });
@@ -87,12 +87,12 @@ describe("useAdminActions — PERC-8311 authority pre-flight checks", () => {
       ).rejects.toThrow(/not the oracle authority/i);
     });
 
-    it("succeeds when wallet IS oracle authority", async () => {
+    it("throws a migration error when wallet IS oracle authority", async () => {
       mockWallet(ORACLE_PK);
       const { result } = renderHook(() => useAdminActions());
       await expect(
         result.current.setOracleAuthority(makeMarket(), ORACLE_PK.toBase58()),
-      ).resolves.not.toThrow();
+      ).rejects.toThrow(/server-side oracle flow/i);
     });
   });
 
@@ -105,12 +105,12 @@ describe("useAdminActions — PERC-8311 authority pre-flight checks", () => {
       ).rejects.toThrow(/not the oracle authority/i);
     });
 
-    it("succeeds when wallet IS oracle authority", async () => {
+    it("throws a migration error when wallet IS oracle authority", async () => {
       mockWallet(ORACLE_PK);
       const { result } = renderHook(() => useAdminActions());
       await expect(
         result.current.pushPrice(makeMarket(), "50000000000"),
-      ).resolves.not.toThrow();
+      ).rejects.toThrow(/server-side oracle flow/i);
     });
   });
 
@@ -179,12 +179,12 @@ describe("useAdminActions — PERC-8311 authority pre-flight checks", () => {
   });
 
   describe("createInsuranceMint", () => {
-    it("throws when wallet is not admin", async () => {
+    it("throws — moved to percolator-stake", async () => {
       mockWallet(STRANGER_PK);
       const { result } = renderHook(() => useAdminActions());
       await expect(
         result.current.createInsuranceMint(makeMarket()),
-      ).rejects.toThrow(/not the market admin/i);
+      ).rejects.toThrow(/percolator-stake/i);
     });
   });
 

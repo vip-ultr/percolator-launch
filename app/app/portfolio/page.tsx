@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect } from "react";
 import { useWalletCompat } from "@/hooks/useWalletCompat";
-import { usePortfolio, getLiquidationSeverity } from "@/hooks/usePortfolio";
+import { usePortfolio, getLiquidationSeverity, type PortfolioPosition } from "@/hooks/usePortfolio";
 import { useLpPositions } from "@/hooks/useLpPositions";
 import { LpPositionsPanel } from "@/components/portfolio/LpPositionsPanel";
 import { formatTokenAmount, formatPriceE6 } from "@/lib/format";
@@ -18,6 +18,7 @@ import { getMockPortfolioPositions } from "@/lib/mock-trade-data";
 import { TradeHistoryTable } from "@/components/trade/TradeHistoryTable";
 import { TradeStatsPanel } from "@/components/trade/TradeStatsPanel";
 import { useTraderStats } from "@/hooks/useTraderStats";
+import { formatLeverage, RISK_LEVERAGE_LABEL, RISK_LEVERAGE_TITLE } from "@/lib/leverage-display";
 
 const ConnectButton = dynamic(
   () => import("@/components/wallet/ConnectButton").then((m) => m.ConnectButton),
@@ -31,7 +32,8 @@ function formatPnl(pnl: bigint | undefined | null, decimals = 6): string {
   return `${isNeg ? "-" : "+"}${formatTokenAmount(abs, decimals)}`;
 }
 
-function formatPnlPct(pct: number): string {
+function formatPnlPct(pct: number | null | undefined): string {
+  if (pct == null) return "0.00%";
   const sign = pct >= 0 ? "+" : "";
   return `${sign}${pct.toFixed(2)}%`;
 }
@@ -45,7 +47,7 @@ export default function PortfolioPage() {
 
   // In mock mode, use synthetic positions
   const mockPositions = mockMode && !walletConnected ? getMockPortfolioPositions() : null;
-  const positions = mockPositions ?? portfolio.positions ?? [];
+  const positions: PortfolioPosition[] = mockPositions ?? portfolio.positions ?? [];
   const atRiskCount = portfolio.atRiskCount ?? 0;
   const loading = mockPositions ? false : portfolio.loading;
   const refresh = portfolio.refresh;
@@ -87,12 +89,12 @@ export default function PortfolioPage() {
     for (const pos of activePositions) {
       const decimals = getDecimals(pos);
       const divisor = 10 ** decimals;
-      const oraclePrice = "oraclePriceE6" in pos ? Number((pos as any).oraclePriceE6) / 1e6 : 0;
+      const oraclePrice = Number(pos.oraclePriceE6) / 1e6;
       // Skip positions with no oracle price — don't fallback to 1 which treats raw capital as USD
       const price = oraclePrice > 0 ? oraclePrice : 0;
       const capital = Number(pos.account.capital ?? 0n) / divisor;
       depositedUsd += capital * price;
-      const unrealized = "unrealizedPnl" in pos ? Number((pos as any).unrealizedPnl) / divisor : 0;
+      const unrealized = Number(pos.unrealizedPnl) / divisor;
       unrealizedPnlUsd += unrealized * price;
     }
     return { depositedUsd, unrealizedPnlUsd, valueUsd: depositedUsd + unrealizedPnlUsd };
@@ -184,7 +186,7 @@ export default function PortfolioPage() {
               },
               {
                 label: "LP Value",
-                value: !walletConnected ? "—" : lpPositions.loading ? "\u2026" : lpPositions.totalRedeemable.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 }),
+                value: !walletConnected ? "—" : lpPositions.loading ? "\u2026" : `$${lpPositions.totalRedeemable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
                 color: !walletConnected ? "text-[var(--text-dim)]" : lpPositions.totalRedeemable > 0 ? "text-[var(--cyan)]" : "text-[var(--text-dim)]",
                 sub: walletConnected && lpPositions.positions.length > 0
                   ? `${lpPositions.positions.length} pool${lpPositions.positions.length > 1 ? "s" : ""}`
@@ -255,16 +257,10 @@ export default function PortfolioPage() {
               {activePositions.map((pos, i) => {
                 const posSize = pos.account?.positionSize ?? 0n;
                 const posCapital = pos.account?.capital ?? 0n;
-                const posEntry = pos.account?.entryPrice ?? 0n;
+                const posEntry = pos.effectiveEntryPrice;
                 const side = posSize > 0n ? "Long" : posSize < 0n ? "Short" : "Flat";
                 const sizeAbs = posSize < 0n ? -posSize : posSize;
-                // Handle both enriched PortfolioPosition and raw mock positions
-                const unrealizedPnl: bigint = "unrealizedPnl" in pos ? (pos as any).unrealizedPnl : (pos.account?.pnl ?? 0n);
-                const pnlPercent: number = "pnlPercent" in pos ? (pos as any).pnlPercent : 0;
-                const oraclePriceE6: bigint = "oraclePriceE6" in pos ? (pos as any).oraclePriceE6 : 0n;
-                const liquidationPriceE6: bigint = "liquidationPriceE6" in pos ? (pos as any).liquidationPriceE6 : 0n;
-                const liquidationDistancePct: number = "liquidationDistancePct" in pos ? (pos as any).liquidationDistancePct : 100;
-                const leverage: number = "leverage" in pos ? (pos as any).leverage : 0;
+                const { unrealizedPnl, pnlPercent, oraclePriceE6, liquidationPriceE6, liquidationDistancePct, leverage } = pos;
                 const pnlPositive = unrealizedPnl >= 0n;
                 const severity = getLiquidationSeverity(liquidationDistancePct);
                 const hasPosition = posSize !== 0n;
@@ -315,8 +311,11 @@ export default function PortfolioPage() {
                             {side.toUpperCase()}
                           </span>
                           {leverage > 0 && (
-                            <span className="rounded bg-[var(--accent)]/10 px-1.5 py-0.5 text-[10px] font-bold text-[var(--accent)]">
-                              {leverage.toFixed(1)}x
+                            <span
+                              className="rounded bg-[var(--accent)]/10 px-1.5 py-0.5 text-[10px] font-bold text-[var(--accent)]"
+                              title={RISK_LEVERAGE_TITLE}
+                            >
+                              Risk {formatLeverage(leverage)}
                             </span>
                           )}
                         </div>
@@ -336,7 +335,7 @@ export default function PortfolioPage() {
                       </div>
 
                       {/* Row 2: Details grid */}
-                      <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-5">
+                      <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-6">
                         <div>
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Size</p>
                           <p className="text-[12px] text-[var(--text)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
@@ -359,6 +358,14 @@ export default function PortfolioPage() {
                           <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]">Capital</p>
                           <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
                             {formatTokenAmount(posCapital, getDecimals(pos))}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[9px] font-medium uppercase tracking-[0.15em] text-[var(--text-dim)]" title={RISK_LEVERAGE_TITLE}>
+                            {RISK_LEVERAGE_LABEL}
+                          </p>
+                          <p className="text-[12px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-jetbrains-mono)", fontVariantNumeric: "tabular-nums" }}>
+                            {leverage > 0 ? formatLeverage(leverage) : "—"}
                           </p>
                         </div>
                         <div>

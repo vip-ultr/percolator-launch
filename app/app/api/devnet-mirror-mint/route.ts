@@ -22,6 +22,8 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { Redis } from "@upstash/redis";
+import { Ratelimit } from "@upstash/ratelimit";
 import {
   Connection,
   Keypair,
@@ -40,6 +42,7 @@ import {
 import { getConfig } from "@/lib/config";
 import { getServiceClient } from "@/lib/supabase";
 import { getDevnetMintSigner } from "@/lib/devnet-signer";
+import { validateTokenMetadata, validateDexScreenerResponse, validateJupiterTokenResponse } from "@/lib/token-metadata-validators";
 import * as Sentry from "@sentry/nextjs";
 
 export const dynamic = "force-dynamic";
@@ -51,23 +54,52 @@ export const dynamic = "force-dynamic";
 // while preventing a single attacker from draining the mint authority wallet.
 const MINT_RATE_LIMIT_MAX = 10;
 const MINT_RATE_LIMIT_WINDOW_MS = 60_000;
-const mintRateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
-function checkMintRateLimit(ip: string): { allowed: boolean; retryAfter: number } {
+// RACE-001 fix: Use Upstash Redis for atomic rate limiting instead of in-memory Map.
+// In-memory approach was vulnerable to concurrent bursts due to TOCTOU race.
+// Upstash Redis provides globally consistent rate limiting across all serverless instances.
+let mintLimiter: Ratelimit | null = null;
+
+function getMintLimiter(): Ratelimit | null {
+  if (mintLimiter) return mintLimiter;
+
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+
+  try {
+    const redis = new Redis({ url, token });
+    mintLimiter = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(MINT_RATE_LIMIT_MAX, "60 s"),
+      prefix: "rl:devnet-mirror-mint",
+      analytics: false,
+    });
+  } catch {
+    return null;
+  }
+
+  return mintLimiter;
+}
+
+// Fallback in-memory rate limiter for local dev when Redis is unconfigured
+const mintRateLimitMapFallback = new Map<string, { count: number; resetAt: number }>();
+
+function checkMintRateLimitFallback(ip: string): { allowed: boolean; retryAfter: number } {
   const now = Date.now();
-  let entry = mintRateLimitMap.get(ip);
+  let entry = mintRateLimitMapFallback.get(ip);
 
   if (!entry || now > entry.resetAt) {
     entry = { count: 0, resetAt: now + MINT_RATE_LIMIT_WINDOW_MS };
-    mintRateLimitMap.set(ip, entry);
+    mintRateLimitMapFallback.set(ip, entry);
   }
 
   entry.count++;
 
   // Occasional GC to prevent unbounded Map growth
   if (Math.random() < 0.01) {
-    for (const [key, val] of mintRateLimitMap) {
-      if (now > val.resetAt) mintRateLimitMap.delete(key);
+    for (const [key, val] of mintRateLimitMapFallback) {
+      if (now > val.resetAt) mintRateLimitMapFallback.delete(key);
     }
   }
 
@@ -75,6 +107,24 @@ function checkMintRateLimit(ip: string): { allowed: boolean; retryAfter: number 
     return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
   }
   return { allowed: true, retryAfter: 0 };
+}
+
+async function checkMintRateLimit(ip: string): Promise<{ allowed: boolean; retryAfter: number }> {
+  const limiter = getMintLimiter();
+  if (limiter) {
+    try {
+      const result = await limiter.limit(ip);
+      return {
+        allowed: result.success,
+        retryAfter: !result.success ? Math.ceil((result.reset - Date.now()) / 1000) : 0,
+      };
+    } catch {
+      // Redis error — fall through to in-memory
+    }
+  }
+
+  // Fallback to in-memory (local dev or Redis unavailable)
+  return checkMintRateLimitFallback(ip);
 }
 
 /** Extract client IP from request headers, respecting proxy depth env var. */
@@ -91,7 +141,9 @@ function getClientIp(req: NextRequest): string {
   return "unknown";
 }
 
-const NETWORK = process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim() ?? "mainnet";
+const NETWORK =
+  process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim() ??
+  process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim();
 
 interface TokenInfo {
   name: string;
@@ -100,7 +152,7 @@ interface TokenInfo {
   logoUrl?: string;
 }
 
-/** Fetch token metadata from DexScreener (mainnet). */
+/** Fetch token metadata from DexScreener (mainnet). DEXSCREENER-001: Validates response. */
 async function fetchMainnetTokenInfo(ca: string): Promise<TokenInfo | null> {
   try {
     const resp = await fetch(
@@ -109,27 +161,17 @@ async function fetchMainnetTokenInfo(ca: string): Promise<TokenInfo | null> {
     );
     if (!resp.ok) return null;
     const json = await resp.json();
-    const pairs = json.pairs;
-    if (!pairs || pairs.length === 0) return null;
+    const pairs = json.pairs as unknown;
 
-    // Sort by liquidity, pick best
-    const sorted = [...pairs].sort(
-      (a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0),
-    );
-    const best = sorted[0] as any;
-
-    return {
-      name: best.baseToken?.name ?? `Token ${ca.slice(0, 6)}`,
-      symbol: best.baseToken?.symbol ?? ca.slice(0, 4).toUpperCase(),
-      decimals: 6, // Default to 6 for devnet mirror (simplifies math)
-      logoUrl: best.info?.imageUrl,
-    };
+    // DEXSCREENER-001: Validate external API response
+    const validated = validateDexScreenerResponse(pairs);
+    return validated ?? null;
   } catch {
     return null;
   }
 }
 
-/** Fallback: fetch metadata from Jupiter token list. */
+/** Fallback: fetch metadata from Jupiter token list. DEXSCREENER-001: Validates response. */
 async function fetchJupiterTokenInfo(ca: string): Promise<TokenInfo | null> {
   try {
     const resp = await fetch(
@@ -138,14 +180,10 @@ async function fetchJupiterTokenInfo(ca: string): Promise<TokenInfo | null> {
     );
     if (!resp.ok) return null;
     const tokens = await resp.json();
-    const token = tokens.find((t: any) => t.address === ca);
-    if (!token) return null;
-    return {
-      name: token.name,
-      symbol: token.symbol,
-      decimals: Math.min(token.decimals, 9), // Cap at 9 for devnet sanity
-      logoUrl: token.logoURI,
-    };
+
+    // DEXSCREENER-001: Validate external API response
+    const validated = validateJupiterTokenResponse(tokens, ca);
+    return validated ?? null;
   } catch {
     return null;
   }
@@ -160,7 +198,7 @@ export async function POST(req: NextRequest) {
     // Per-endpoint rate limit: 10 req/min/IP (tighter than global 120/min).
     // Prevents SOL drain on the shared DEVNET_MINT_AUTHORITY_KEYPAIR.
     const clientIp = getClientIp(req);
-    const { allowed, retryAfter } = checkMintRateLimit(clientIp);
+    const { allowed, retryAfter } = await checkMintRateLimit(clientIp);
     if (!allowed) {
       return NextResponse.json(
         { error: "Too many mint requests. Please wait before retrying." },
@@ -212,7 +250,7 @@ export async function POST(req: NextRequest) {
 
     // 1. Check for existing mapping
     const supabase = getServiceClient();
-    const { data: existing } = await (supabase as any)
+    const { data: existing } = await supabase
       .from("devnet_mints")
       .select("devnet_mint, name, symbol, decimals, logo_url")
       .eq("mainnet_ca", mainnetCA)
@@ -345,7 +383,7 @@ export async function POST(req: NextRequest) {
     //  upsert ON CONFLICT (mainnet_ca) DO NOTHING prevents duplicate rows and
     //  avoids a second createMint call winning a race that corrupts the table.)
     // GH#1476: include creator_wallet so the column constraint is satisfied.
-    const { error: upsertError } = await (supabase as any).from("devnet_mints").upsert(
+    const { error: upsertError } = await supabase.from("devnet_mints").upsert(
       {
         mainnet_ca: mainnetCA,
         devnet_mint: devnetMint,
@@ -370,7 +408,7 @@ export async function POST(req: NextRequest) {
     // Re-SELECT the canonical row from DB to handle TOCTOU races (#772):
     // If two concurrent requests both created mints, only one wins the upsert.
     // Return the DB-canonical devnetMint so all callers get the same address.
-    const { data: canonical } = await (supabase as any)
+    const { data: canonical } = await supabase
       .from("devnet_mints")
       .select("devnet_mint")
       .eq("mainnet_ca", mainnetCA)

@@ -73,10 +73,16 @@ export const StepOracleSelect: FC<StepOracleSelectProps> = ({
     } else if (best.type === "dex") {
       onOracleTypeChange("hyperp_ema");
       onOracleFeedChange(best.address);
+      // Parse base/quote symbols from pairLabel (format: "BASE / QUOTE").
+      // Falls back to "?" if pairLabel is absent or malformed.
+      const rawPairLabel = best.pairLabel || "DEX Pool";
+      const [parsedBase = "?", parsedQuote = "?"] = rawPairLabel.split("/").map((s) => s.trim());
       onDexPoolDetected({
         poolAddress: best.address,
         dexId: best.dexId || "unknown",
-        pairLabel: best.pairLabel || "DEX Pool",
+        pairLabel: rawPairLabel,
+        baseSymbol: parsedBase,
+        quoteSymbol: parsedQuote,
         liquidityUsd: best.liquidity,
         priceUsd: best.price,
       });

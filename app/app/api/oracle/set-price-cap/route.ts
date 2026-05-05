@@ -15,9 +15,30 @@
  * Authentication: requires x-admin-secret header matching ADMIN_API_SECRET env var.
  * If ADMIN_API_SECRET is unset or whitespace-only, all requests are rejected (401).
  *
+ * CONFIG-001 (Defense-in-Depth — Secret Rotation):
+ * The ADMIN_API_SECRET is stored as a Vercel environment variable for simplicity.
+ * While the endpoint is secure (timing-safe comparison, generic error messages),
+ * consider these best practices for production:
+ *
+ * 1. REGULAR ROTATION: Rotate ADMIN_API_SECRET every 30-90 days via Vercel console
+ *    - Go to Settings → Environment Variables
+ *    - Update ADMIN_API_SECRET with a new random value
+ *    - Vercel will redeploy automatically
+ *
+ * 2. USING SECRETS MANAGER (Optional): For higher security, use a secrets vault:
+ *    - AWS Secrets Manager, Vault, or similar
+ *    - Fetch secret at runtime instead of from env var
+ *    - Reduces time window of exposure if system is compromised
+ *
+ * 3. AUDIT LOGGING: Log all price-cap changes (slabAddress, oldValue, newValue)
+ *    in the markets table for audit trail
+ *
+ * 4. LEAST PRIVILEGE: Only expose this endpoint to authorized admin systems
+ *    (e.g., rate-limit or IP-allow-list clients)
+ *
  * Requires:
  *   - CRANK_KEYPAIR — JSON or base58 secret key (oracle authority keypair)
- *   - ADMIN_API_SECRET — shared secret for this endpoint
+ *   - ADMIN_API_SECRET — shared secret for this endpoint (rotate periodically)
  *   - NEXT_PUBLIC_SOLANA_RPC_URL or HELIUS_API_KEY for RPC
  */
 
@@ -36,7 +57,7 @@ import {
   buildIx,
   buildAccountMetas,
   ACCOUNTS_SET_ORACLE_PRICE_CAP,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { getConfig } from "@/lib/config";
 import { getServiceClient } from "@/lib/supabase";
 
@@ -134,7 +155,7 @@ export async function POST(req: NextRequest) {
     // Fetch all admin-oracle markets from DB where oracle_authority == our crank pubkey
     try {
       const supabase = getServiceClient();
-      const { data, error } = await (supabase as any)
+      const { data, error } = await supabase
         .from("markets")
         .select("slab_address, oracle_authority, symbol")
         .not("oracle_authority", "is", null);

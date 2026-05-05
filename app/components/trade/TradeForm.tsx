@@ -13,7 +13,7 @@ import { useSlabState } from "@/components/providers/SlabProvider";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import { useOracleFreshness } from "@/hooks/useOracleFreshness";
-import { AccountKind, computePreTradeLiqPrice, computeLiqPrice, computeMarkPnl, computePnlPercent } from "@percolator/sdk";
+import { AccountKind, computePreTradeLiqPrice, computeLiqPrice, computeMarkPnl, computePnlPercent } from "@percolatorct/sdk";
 import { PreTradeSummary } from "@/components/trade/PreTradeSummary";
 import { TradeConfirmationModal } from "@/components/trade/TradeConfirmationModal";
 import { ClosePositionModal } from "@/components/trade/ClosePositionModal";
@@ -26,6 +26,16 @@ import { sanitizeSymbol } from "@/lib/symbol-utils";
 import { useMarketInfo } from "@/hooks/useMarketInfo";
 import { formatTokenAmount, formatUsd } from "@/lib/format";
 import { useClosePosition } from "@/hooks/useClosePosition";
+import { saveEntryPrice, getEntryPrice, getEntryLeverage, clearEntryPrice } from "@/lib/entry-price";
+import { isSentinelValue } from "@/lib/health";
+import { DepositWithdrawCard } from "@/components/trade/DepositWithdrawCard";
+import { useInitUser } from "@/hooks/useInitUser";
+import {
+  formatLeverage,
+  ORDER_LEVERAGE_TITLE,
+  RISK_LEVERAGE_LABEL,
+  RISK_LEVERAGE_TITLE,
+} from "@/lib/leverage-display";
 
 const LEVERAGE_SNAP_POINTS = [1, 2, 5, 10, 20];
 const MARGIN_PRESETS = [25, 50, 75, 100];
@@ -78,7 +88,7 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const oracleStale = oracleUnavailable || (oracleReady && oracleLevel === "stale" && (oracleMode === "admin" || oracleMode === "hyperp"));
   const openWalletModal = usePrivyLogin();
   const mintAddress = mktConfig?.collateralMint?.toBase58() ?? "";
-  const symbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
+  const collateralSymbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
   
   // BUG FIX: Fetch on-chain decimals from token account (like DepositWithdrawCard)
   // Don't rely solely on tokenMeta which may fail for cross-network tokens
@@ -125,11 +135,33 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const [contractsInput, setContractsInput] = useState("");
   const [usdcInput, setUsdcInput] = useState("");
   const [leverage, setLeverage] = useState(1);
+  const [leverageText, setLeverageText] = useState("1");
   const [lastSig, setLastSig] = useState<string | null>(null);
   const [tradePhase, setTradePhase] = useState<"idle" | "submitting" | "confirming">("idle");
   const [humanError, setHumanError] = useState<string | null>(null);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
+  // Snapshot modal props when opening to prevent live price updates from
+  // causing re-renders / flicker while the confirmation modal is open.
+  const [confirmSnapshot, setConfirmSnapshot] = useState<{
+    positionSize: bigint;
+    marginNative: bigint;
+    estimatedLiqPrice: bigint;
+    tradingFee: bigint;
+  } | null>(null);
   const [showCloseModal, setShowCloseModal] = useState(false);
+  // Inline deposit form. Only rendered as a *fallback* — when the user has
+  // zero collateral tokens in their wallet (and therefore needs the faucet
+  // button inside DepositWithdrawCard), or when they already have an account
+  // but zero capital (rare — requires picking a deposit amount). The common
+  // case (connected wallet + tokens + no account) is handled by a direct
+  // one-click initUser call below, so the button itself opens the wallet.
+  const [showInlineDeposit, setShowInlineDeposit] = useState(false);
+
+  // Direct one-click account creation. initUser(0n) auto-bumps feePayment to
+  // (newAccountFee + minInitialDeposit), so the user ends up with a registered
+  // sub-account AND the minimum required capital in a single tx.
+  const { initUser, loading: initLoading, error: initError } = useInitUser(slabAddress);
+  const [initCtaError, setInitCtaError] = useState<string | null>(null);
 
   const longBtnRef = useRef<HTMLButtonElement>(null);
   const shortBtnRef = useRef<HTMLButtonElement>(null);
@@ -152,6 +184,9 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   // data is unavailable (uninitialised slab / initialMarginBps == 0).
   // GH#1962: Fix — do NOT use max(on-chain, Supabase). Supabase must never loosen the cap.
   const { market: marketInfo } = useMarketInfo(slabAddress);
+  // BUG FIX: Use Supabase market symbol for the trading pair display (e.g. "SOL"),
+  // falling back to collateral symbol. Prevents "USDC/USD" when the market is actually SOL/USD.
+  const symbol = marketInfo?.symbol ?? collateralSymbol;
   const initialMarginBps = params?.initialMarginBps ?? 1000n;
   const maintenanceMarginBps = params?.maintenanceMarginBps ?? 500n;
   const tradingFeeBps = params?.tradingFeeBps ?? 30n;
@@ -182,6 +217,17 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const existingPosition = userAccount ? userAccount.account.positionSize : 0n;
   const hasPosition = existingPosition !== 0n;
 
+  // Auto-close the inline deposit form the moment a deposit lands on-chain
+  // (capital transitions 0 → >0). Without this, the user has to manually
+  // dismiss the card after seeing the confirmation tx, which feels janky.
+  const prevCapitalRef = useRef<bigint>(capital);
+  useEffect(() => {
+    if (prevCapitalRef.current === 0n && capital > 0n) {
+      setShowInlineDeposit(false);
+    }
+    prevCapitalRef.current = capital;
+  }, [capital]);
+
   // GH#1133: When no trading account exists yet, use wallet ATA balance as the
   // effective balance for validation (exceedsMargin, %-presets, Max button).
   // capital=0n from a null userAccount is misleading — the user may have tokens
@@ -197,11 +243,10 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
     setContractsInput(val.replace(/[^0-9.]/g, ""));
     const n = parseFloat(val);
     if (!isNaN(n) && priceUsd && priceUsd > 0) {
-      const usd = n * priceUsd;
-      setUsdcInput(usd.toFixed(2));
-      // margin = notional / leverage
-      const marginAmt = n / leverage;
-      // Use full token decimals so marginInput matches parsePercToNative(..., decimals) (Prompt 88).
+      const notionalUsd = n * priceUsd;
+      setUsdcInput(notionalUsd.toFixed(2));
+      // margin (in collateral) = notional_usd / leverage
+      const marginAmt = notionalUsd / leverage;
       setMarginInput(marginAmt.toFixed(decimals));
     } else if (val === "" || val === ".") {
       setUsdcInput("");
@@ -215,9 +260,8 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
     if (!isNaN(usd) && priceUsd && priceUsd > 0) {
       const contracts = usd / priceUsd;
       setContractsInput(contracts.toFixed(6));
-      // margin = contracts / leverage
-      const marginAmt = contracts / leverage;
-      // Use full token decimals so marginInput matches parsePercToNative(..., decimals) (Prompt 88).
+      // margin (in collateral) = notional_usd / leverage
+      const marginAmt = usd / leverage;
       setMarginInput(marginAmt.toFixed(decimals));
     } else if (val === "" || val === ".") {
       setContractsInput("");
@@ -225,14 +269,22 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
     }
   }, [priceUsd, leverage, decimals]);
 
-  // Re-sync USDC field when leverage changes (contracts stay fixed, USDC doesn't change, margin changes)
+  // Re-sync margin when leverage changes (contracts stay fixed, margin = notional / leverage)
+  // Re-sync margin when leverage changes (contracts stay fixed, use current price)
+  const priceRef = useRef(priceUsd);
+  priceRef.current = priceUsd;
+  const prevLeverageRef = useRef(leverage);
   useEffect(() => {
+    if (prevLeverageRef.current === leverage) return;
+    prevLeverageRef.current = leverage;
     if (!contractsInput) return;
     const n = parseFloat(contractsInput);
-    if (!isNaN(n) && n > 0 && priceUsd && priceUsd > 0) {
-      const marginAmt = n / leverage;
-      // Use full token decimals so marginInput matches parsePercToNative(..., decimals) (Prompt 88).
+    const price = priceRef.current;
+    if (!isNaN(n) && n > 0 && price && price > 0) {
+      const notionalUsd = n * price;
+      const marginAmt = notionalUsd / leverage;
       setMarginInput(marginAmt.toFixed(decimals));
+      setUsdcInput(notionalUsd.toFixed(2));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leverage]);
@@ -241,14 +293,18 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const openPositionSize = existingPosition;
   const hasOpenPosition = openPositionSize !== 0n;
   const isOpenLong = openPositionSize > 0n;
-  const openEntryPriceE6 = userAccount?.account.entryPrice ?? 0n;
+  const rawOpenEntryPrice = userAccount?.account.entryPrice ?? 0n;
+  // V12_1: entry_price removed from on-chain struct. Fall back to saved entry price.
+  const savedOpenEntryPrice = rawOpenEntryPrice > 0n ? 0n : (userAccount ? getEntryPrice(slabAddress, userAccount.idx) : 0n);
+  const openEntryPriceE6 = rawOpenEntryPrice > 0n ? rawOpenEntryPrice : (savedOpenEntryPrice > 0n ? savedOpenEntryPrice : 0n);
   const openCapital = userAccount?.account.capital ?? 0n;
-  const openLiqPriceE6 = hasOpenPosition
+  const openLiqPriceE6 = hasOpenPosition && openEntryPriceE6 > 0n
     ? computeLiqPrice(openEntryPriceE6, openCapital, openPositionSize, maintenanceMarginBps)
     : 0n;
-  const openPnlTokens = hasOpenPosition && livePriceE6 && livePriceE6 > 0n
-    ? computeMarkPnl(openPositionSize, openEntryPriceE6, livePriceE6)
-    : 0n;
+  const resolvedOpenEntry = openEntryPriceE6 > 0n ? openEntryPriceE6 : 0n;
+  const openPnlTokens = hasOpenPosition && livePriceE6 && livePriceE6 > 0n && resolvedOpenEntry > 0n
+    ? computeMarkPnl(openPositionSize, resolvedOpenEntry, livePriceE6)
+    : (userAccount?.account.pnl !== undefined && !isSentinelValue(userAccount.account.pnl) ? userAccount.account.pnl : 0n);
   const openPnlPercent = hasOpenPosition ? computePnlPercent(openPnlTokens, openCapital) : 0;
   // Liq danger: within 20% of mark
   const openLiqDanger = (() => {
@@ -256,14 +312,26 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
     const dist = Math.abs(Number(livePriceE6) - Number(openLiqPriceE6)) / Number(livePriceE6);
     return dist < 0.20;
   })();
-  const openLeverage = hasOpenPosition && openCapital > 0n
-    ? Math.max(1, Math.round(Number(abs(openPositionSize)) / Number(openCapital)))
-    : 1;
+  const savedOpenLeverage = userAccount ? getEntryLeverage(slabAddress, userAccount.idx) : null;
+  const openAccountLeverage = hasOpenPosition && openCapital > 0n && livePriceE6 && livePriceE6 > 0n
+    ? Number((abs(openPositionSize) * livePriceE6) / 1_000_000n) / Number(openCapital)
+    : 0;
+  const openDisplayLeverage = savedOpenLeverage ?? openAccountLeverage;
+  const openDisplayLeverageLabel = savedOpenLeverage != null ? "Order" : "Risk";
+  const openLeverageTitle = savedOpenLeverage != null
+    ? `${ORDER_LEVERAGE_TITLE} ${RISK_LEVERAGE_LABEL} is ${formatLeverage(openAccountLeverage)} because all collateral in this slab account backs liquidation.`
+    : RISK_LEVERAGE_TITLE;
   const { closePosition, loading: closeLoading } = useClosePosition(slabAddress);
 
   const marginNative = marginInput ? parsePercToNative(marginInput, decimals) : 0n;
-  // Defensive clamp: positionSize should never be negative, but guard anyway
-  const rawPositionSize = marginNative * BigInt(leverage);
+  // Position size = contracts (index asset units), NOT USDC.
+  // Coin-margined: notional_usdc = margin × leverage, then contracts = notional / markPrice.
+  // Without price division, a "1 USDC" input sends 1M units on-chain which the program
+  // interprets as 1M × $80 = $80M notional — causing undercollateralized errors.
+  const notionalNative = marginNative * BigInt(leverage);
+  const rawPositionSize = livePriceE6 && livePriceE6 > 0n
+    ? (notionalNative * 1_000_000n) / livePriceE6
+    : 0n;
   const positionSize = rawPositionSize < 0n ? 0n : rawPositionSize;
   
   // GH#1133: Use effectiveBalance (wallet ATA when no account) so input isn't
@@ -279,15 +347,45 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
       if (amount === 0n && pct > 0) amount = 1n;
       const marginStr = formatPerc(amount, decimals);
       setMarginInput(marginStr);
-      // Sync dual size inputs: contracts = margin * leverage
+      // Sync dual size inputs: notional = margin * leverage, contracts = notional / price
       const marginNum = Number(amount) / Math.pow(10, decimals);
-      const contracts = marginNum * leverage;
-      setContractsInput(contracts.toFixed(6));
+      const notionalUsd = marginNum * leverage;
       if (priceUsd && priceUsd > 0) {
-        setUsdcInput((contracts * priceUsd).toFixed(2));
+        const contracts = notionalUsd / priceUsd;
+        setContractsInput(contracts.toFixed(6));
+        setUsdcInput(notionalUsd.toFixed(2));
+      } else {
+        setContractsInput("");
+        setUsdcInput(notionalUsd.toFixed(2));
       }
     },
     [effectiveBalance, decimals, leverage, priceUsd]
+  );
+
+  // Dynamic slider: when the user moves the leverage slider, keep the committed
+  // margin fixed and recompute notional/size so the slider's number equals the
+  // effective leverage on the trade. Without this, the slider only changes the
+  // summary math silently while the size inputs stay stale from the previous
+  // leverage setting.
+  const updateLeverage = useCallback(
+    (newLev: number) => {
+      setLeverage(newLev);
+      setLeverageText(String(newLev));
+      // If user already sized the position via margin, recompute size fields.
+      if (!marginInput) return;
+      const marginNumRaw = parseFloat(marginInput);
+      if (!Number.isFinite(marginNumRaw) || marginNumRaw <= 0) return;
+      const notionalUsd = marginNumRaw * newLev;
+      if (priceUsd && priceUsd > 0) {
+        const contracts = notionalUsd / priceUsd;
+        setContractsInput(contracts.toFixed(6));
+        setUsdcInput(notionalUsd.toFixed(2));
+      } else {
+        setContractsInput("");
+        setUsdcInput(notionalUsd.toFixed(2));
+      }
+    },
+    [marginInput, priceUsd],
   );
 
   // BUG FIX: Fetch on-chain decimals AND wallet ATA balance from user's token account.
@@ -358,8 +456,13 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const needsDeposit = connected && userAccount && capital === 0n;
   const canTrade = connected && userAccount && capital > 0n && !lpUnderfunded;
 
-  async function handleTrade() {
-    if (!marginInput || !userAccount || positionSize <= 0n || exceedsMargin) return;
+  async function handleTrade(snapshotSize?: bigint) {
+    // Use the snapshotted size from the confirmation modal so the submitted
+    // trade matches what the user reviewed, even if the live price moved
+    // between modal-open and confirm. Fall back to live size if no snapshot
+    // (e.g. mock mode or non-confirm code paths).
+    const effectiveSize = snapshotSize ?? positionSize;
+    if (!marginInput || !userAccount || effectiveSize <= 0n || exceedsMargin) return;
 
     if (mockMode) {
       setTradePhase("submitting");
@@ -367,16 +470,16 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
       setTimeout(() => setTradePhase("idle"), 2000);
       return;
     }
-    
+
     if (!connected) {
       setHumanError("Wallet disconnected. Please reconnect your wallet.");
       return;
     }
-    
+
     setHumanError(null);
     setTradePhase("submitting");
     try {
-      const size = direction === "short" ? -positionSize : positionSize;
+      const size = direction === "short" ? -effectiveSize : effectiveSize;
       const sig = await withTransientRetry(
         async () => trade({ lpIdx, userIdx: userAccount!.idx, size }),
         { maxRetries: 2, delayMs: 3000 },
@@ -384,10 +487,18 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
       setTradePhase("confirming");
       setLastSig(sig ?? null);
       setMarginInput("");
-      // GH#trading-race: Trigger immediate slab re-poll so position appears
-      // without waiting up to 30s for the next adaptive poll cycle.
-      refreshSlab();
-      setTimeout(() => { setTradePhase("idle"); refreshSlab(); }, 2000);
+      // V12_1: entry_price removed from on-chain struct. Save mark price at
+      // trade time so the frontend can compute unrealized PnL.
+      if (livePriceE6 && livePriceE6 > 0n && userAccount) {
+        saveEntryPrice(slabAddress, userAccount.idx, livePriceE6, leverage);
+      }
+      // GH#trading-race: Single delayed refresh — give the on-chain state
+      // time to settle before re-polling. Avoids the double-refresh that
+      // causes provider state thrashing and modal flicker.
+      setTimeout(() => {
+        refreshSlab();
+        setTradePhase("idle");
+      }, 1500);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error("[TradeForm] raw error:", msg);
@@ -430,7 +541,13 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
                 {isOpenLong ? "LONG" : "SHORT"}
               </span>
               <span className="text-[10px] text-[var(--text-dim)]">{symbol}/USD</span>
-              <span className="text-[10px] font-bold text-cyan-400" style={{ fontFamily: "var(--font-mono)" }}>{openLeverage}x</span>
+              <span
+                className="text-[10px] font-bold text-cyan-400"
+                style={{ fontFamily: "var(--font-mono)" }}
+                title={openLeverageTitle}
+              >
+                {openDisplayLeverageLabel} {formatLeverage(openDisplayLeverage)}
+              </span>
             </div>
             <button
               onClick={() => setShowCloseModal(true)}
@@ -468,6 +585,14 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
                 <span className="ml-1 text-[9px]">({openPnlPercent >= 0 ? "+" : ""}{openPnlPercent.toFixed(2)}%)</span>
               </span>
             </div>
+            {savedOpenLeverage != null && (
+              <div title={RISK_LEVERAGE_TITLE}>
+                <span className="text-[var(--text-dim)] uppercase tracking-[0.08em]">{RISK_LEVERAGE_LABEL}</span>
+                <span className="ml-2 font-mono font-medium text-[var(--text)]">
+                  {formatLeverage(openAccountLeverage)}
+                </span>
+              </div>
+            )}
           </div>
           {/* Action buttons */}
           <div className="mt-3 grid grid-cols-2 gap-1.5">
@@ -540,6 +665,14 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
         </div>
       )}
 
+      {/* Order type indicator — market orders only */}
+      <div className="mb-3 flex items-center gap-1.5">
+        <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Order Type</span>
+        <span className="rounded-none border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-[var(--accent)]">
+          Market
+        </span>
+      </div>
+
       {/* Direction toggle */}
       <div className="mb-3 flex gap-1">
         <button
@@ -571,7 +704,7 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
         <div className="mb-1.5 flex items-center justify-between">
           <label className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Size<InfoIcon tooltip="Position size — enter in contracts (tokens) or USD. Both fields sync automatically." /></label>
           <span className="text-[10px] text-[var(--text-dim)] whitespace-nowrap min-w-0 shrink-0" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
-            Bal: {userAccount ? formatPerc(capital, decimals) : (walletAtaBalance !== null ? formatPerc(walletAtaBalance, decimals) : "—")} {symbol}
+            Bal: {userAccount ? formatPerc(capital, decimals) : (walletAtaBalance !== null ? formatPerc(walletAtaBalance, decimals) : "—")} {collateralSymbol}
           </span>
         </div>
         <div className="grid grid-cols-2 gap-1.5">
@@ -616,7 +749,7 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
         </div>
         {exceedsMargin && (
           <p className="mt-1 text-[10px] text-[var(--short)]" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
-            Exceeds balance ({formatPerc(effectiveBalance, decimals)} {symbol})
+            Exceeds balance ({formatPerc(effectiveBalance, decimals)} {collateralSymbol})
           </p>
         )}
       </div>
@@ -637,8 +770,32 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
       {/* Leverage slider + presets */}
       <div className="mb-5">
         <div className="mb-1 flex items-center justify-between">
-          <label className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Leverage<InfoIcon tooltip="Multiplies your position size. 5x leverage means 5x the profit but also 5x the loss. Higher leverage = higher risk of liquidation." /></label>
-          <span className="text-[11px] font-medium text-[var(--text)]" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>{leverage}x</span>
+          <label className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">
+            Order Leverage
+            <InfoIcon tooltip="The slider value used to size this order. Your displayed risk leverage can be lower when this slab account has extra collateral." />
+          </label>
+          <div className="flex items-center gap-1">
+            <input
+              type="text"
+              value={leverageText}
+              onChange={(e) => {
+                const raw = e.target.value.replace(/[^0-9.]/g, "");
+                setLeverageText(raw);
+                const parsed = parseFloat(raw);
+                if (!isNaN(parsed)) {
+                  const clamped = Math.max(1, Math.min(maxLeverage, Math.round(parsed)));
+                  updateLeverage(clamped);
+                }
+              }}
+              onBlur={() => {
+                // Normalise display on blur
+                setLeverageText(String(leverage));
+              }}
+              style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}
+              className="w-12 rounded-none border border-[var(--border)]/50 bg-[var(--bg)] px-1.5 py-0.5 text-right text-[11px] text-[var(--text)] focus:border-[var(--accent)]/50 focus:outline-none focus:ring-1 focus:ring-[var(--accent)]/20"
+            />
+            <span className="text-[11px] font-medium text-[var(--text-dim)]">x</span>
+          </div>
         </div>
         <input
           type="range"
@@ -646,7 +803,10 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           max={maxLeverage}
           step={1}
           value={leverage}
-          onChange={(e) => setLeverage(Number(e.target.value))}
+          onChange={(e) => {
+            const val = Number(e.target.value);
+            updateLeverage(val);
+          }}
           style={{
             background: `linear-gradient(to right, var(--accent) 0%, var(--accent) ${maxLeverage > 1 ? ((leverage - 1) / (maxLeverage - 1)) * 100 : 100}%, var(--bg-surface) ${maxLeverage > 1 ? ((leverage - 1) / (maxLeverage - 1)) * 100 : 100}%, var(--bg-surface) 100%)`,
           }}
@@ -656,7 +816,7 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           {availableLeverage.map((l) => (
             <button
               key={l}
-              onClick={() => setLeverage(l)}
+              onClick={() => updateLeverage(l)}
               className={`flex-1 basis-0 min-w-[32px] rounded-none py-1.5 min-h-[36px] text-[9px] font-medium transition-all duration-150 focus-visible:ring-1 focus-visible:ring-[var(--accent)]/30 touch-manipulation ${
                 leverage === l
                   ? "bg-[var(--accent)] text-white"
@@ -674,7 +834,7 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
         <div className="mb-5 border border-[var(--accent)]/30 bg-[var(--accent)]/[0.04] px-4 py-3 text-[11px] space-y-1">
           <p className="text-[var(--accent)] font-medium">⚡ Mainnet Phase 1 Guards Active</p>
           <p className="text-[var(--text-muted)]">• $10K OI cap per market during beta</p>
-          <p className="text-[var(--text-muted)]">• 2x max leverage enforced on-chain</p>
+          <p className="text-[var(--text-muted)]">• {maxLeverage}x max leverage enforced on-chain</p>
           <p className="text-[var(--text-muted)]">• Guards auto-lift when caps are raised by DAO</p>
         </div>
       )}
@@ -690,7 +850,9 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           tradingFeeBps={tradingFeeBps}
           maintenanceMarginBps={maintenanceMarginBps}
           symbol={symbol}
+          collateralSymbol={collateralSymbol}
           decimals={decimals}
+          accountEquity={userAccount ? capital : null}
         />
       )}
 
@@ -703,24 +865,75 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           Connect Wallet
         </button>
       ) : needsAccount || needsDeposit ? (
-        <button
-          onClick={() => {
-            // Scroll to the deposit trigger above the form
-            const deposit = document.querySelector('[data-deposit-trigger]');
-            if (deposit) deposit.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }}
-          className={`w-full rounded-none py-2.5 text-[11px] font-bold uppercase tracking-[0.1em] text-black transition-all duration-150 hover:scale-[1.01] active:scale-[0.99] focus-visible:ring-1 focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg)] ${
-            direction === "long"
-              ? "bg-green-500 hover:bg-green-400 focus-visible:ring-green-500"
-              : "bg-red-500 hover:bg-red-400 focus-visible:ring-red-500"
-          }`}
-        >
-          {needsAccount ? "Create Account & Deposit" : "Deposit to Trade"}
-        </button>
+        <>
+          {(() => {
+            // One-click path: user has an unspent collateral balance in their
+            // wallet and just needs to create the sub-account. initUser with a
+            // 0 hint bumps feePayment to the on-chain minimum, so a single tx
+            // registers the slot AND deposits minInitialDeposit as capital.
+            // The user will then see the top "Account" balance bar appear and
+            // can top up further without going through this CTA again.
+            const hasWalletTokens = (walletAtaBalance ?? 0n) > 0n;
+            const canOneClick = needsAccount && hasWalletTokens && !showInlineDeposit;
+            const onClickDirect = async () => {
+              setInitCtaError(null);
+              try {
+                await initUser(0n);
+                // On success, useInitUser refreshes the slab; userAccount will
+                // populate on the next poll and this whole branch unmounts.
+              } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                // User-rejected wallet signatures shouldn't surface as errors.
+                if (!/user rejected|cancelled|denied/i.test(msg)) {
+                  setInitCtaError(msg);
+                }
+              }
+            };
+            return (
+              <button
+                onClick={canOneClick ? onClickDirect : () => setShowInlineDeposit((v) => !v)}
+                disabled={initLoading}
+                aria-expanded={showInlineDeposit}
+                className={`w-full rounded-none py-2.5 text-[11px] font-bold uppercase tracking-[0.1em] text-black transition-all duration-150 hover:scale-[1.01] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-70 focus-visible:ring-1 focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg)] ${
+                  direction === "long"
+                    ? "bg-green-500 hover:bg-green-400 focus-visible:ring-green-500"
+                    : "bg-red-500 hover:bg-red-400 focus-visible:ring-red-500"
+                }`}
+              >
+                {initLoading
+                  ? "Creating account…"
+                  : showInlineDeposit
+                  ? "Close"
+                  : canOneClick
+                  ? "Create Account & Deposit"
+                  : needsAccount
+                  ? "Get Tokens to Trade"
+                  : "Deposit to Trade"}
+              </button>
+            );
+          })()}
+          {(initCtaError || initError) && (
+            <p className="mt-1 text-[10px] text-[var(--short)]">{initCtaError ?? initError}</p>
+          )}
+          {showInlineDeposit && (
+            <div className="mt-1.5">
+              <DepositWithdrawCard slabAddress={slabAddress} />
+            </div>
+          )}
+        </>
       ) : (
         <button
           onClick={() => {
             if (!marginInput || !userAccount || positionSize <= 0n || exceedsMargin || riskGateActive || header?.paused || tradePhase !== "idle" || loading || (!priceUsd && !mockMode) || (oracleStale && !mockMode)) return;
+            // Snapshot all price-dependent values so the modal doesn't flicker
+            // when WebSocket price updates arrive while it's open.
+            const oracleE6 = priceUsd ? BigInt(Math.round(priceUsd * 1e6)) : 0n;
+            setConfirmSnapshot({
+              positionSize,
+              marginNative,
+              estimatedLiqPrice: computePreTradeLiqPrice(oracleE6, marginNative, positionSize, maintenanceMarginBps, tradingFeeBps, direction),
+              tradingFee: livePriceE6 && livePriceE6 > 0n ? ((positionSize * livePriceE6 / 1_000_000n) * tradingFeeBps) / 10000n : 0n,
+            });
             setShowConfirmModal(true);
           }}
           disabled={tradePhase !== "idle" || loading || !marginInput || positionSize <= 0n || exceedsMargin || riskGateActive || header?.paused || lpUnderfunded || vaultEmpty || (!priceUsd && !mockMode) || (oracleStale && !mockMode)}
@@ -768,18 +981,22 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
 
       {/* Coin-margined info — compact tooltip hint */}
       <div className="mt-3 flex items-center gap-1.5">
-        <InfoIcon tooltip={`This market is margined in ${symbol}, not USD. Position value and liq risk are affected by the collateral token's price. Effective USD leverage ≈ ${leverage > 0 ? `${leverage * 2}x` : "—"} (nominal ${leverage}x × 2 for coin exposure).`} />
+        <InfoIcon tooltip={`This market is margined in ${collateralSymbol}, not USD. Position value and liq risk are affected by the collateral token's price. Effective USD leverage ≈ ${leverage > 0 ? `${leverage * 2}x` : "—"} (nominal ${leverage}x × 2 for coin exposure).`} />
+        <InfoIcon tooltip={`This market is margined in ${symbol}, not USD. Position value and liq risk are affected by the collateral token's price. Selected leverage: ${leverage > 0 ? `${leverage}x` : "—"}.`} />
         <span className="text-[9px] text-[var(--text-dim)] uppercase tracking-[0.1em]">Coin-margined market</span>
       </div>
 
       {/* Close position modal */}
-      {showCloseModal && hasOpenPosition && userAccount && (
+      {/* Latch: don't unmount modal when hasOpenPosition briefly goes false
+          during slab refresh after close. showCloseModal is the sole dismiss gate. */}
+      {showCloseModal && userAccount && (
         <ClosePositionModal
           positionSize={openPositionSize}
           entryPrice={openEntryPriceE6}
           currentPrice={livePriceE6 ?? 0n}
           capital={openCapital}
           symbol={symbol}
+          collateralSymbol={collateralSymbol}
           decimals={decimals}
           priceUsd={priceUsd}
           isLong={isOpenLong}
@@ -787,36 +1004,39 @@ export const TradeForm: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           oracleStale={oracleStale && !mockMode}
           onConfirm={async (percent) => {
             await closePosition(percent);
-            setShowCloseModal(false);
+            // Clear saved entry price on full close
+            if (percent === 100 && userAccount) {
+              clearEntryPrice(slabAddress, userAccount.idx);
+            }
+            // Delay modal close until after slab refresh settles.
             refreshSlab();
+            setTimeout(() => { setShowCloseModal(false); refreshSlab(); }, 1500);
           }}
           onCancel={() => setShowCloseModal(false)}
         />
       )}
 
-      {/* Trade confirmation modal */}
-      {showConfirmModal && marginNative > 0n && positionSize > 0n && (
+      {/* Trade confirmation modal — uses snapshotted values to prevent
+          flicker from live price updates while the modal is open. */}
+      {showConfirmModal && confirmSnapshot && (
         <TradeConfirmationModal
           direction={direction}
-          positionSize={positionSize}
-          margin={marginNative}
+          positionSize={confirmSnapshot.positionSize}
+          margin={confirmSnapshot.marginNative}
           leverage={leverage}
-          estimatedLiqPrice={computePreTradeLiqPrice(
-            priceUsd ? BigInt(Math.round(priceUsd * 1e6)) : 0n,
-            marginNative,
-            positionSize,
-            maintenanceMarginBps,
-            tradingFeeBps,
-            direction,
-          )}
-          tradingFee={(positionSize * tradingFeeBps) / 10000n}
+          estimatedLiqPrice={confirmSnapshot.estimatedLiqPrice}
+          tradingFee={confirmSnapshot.tradingFee}
+          accountEquity={userAccount ? capital : null}
           symbol={symbol}
+          collateralSymbol={collateralSymbol}
           decimals={decimals}
           onConfirm={() => {
+            const snapSize = confirmSnapshot.positionSize;
             setShowConfirmModal(false);
-            handleTrade();
+            setConfirmSnapshot(null);
+            handleTrade(snapSize);
           }}
-          onCancel={() => setShowConfirmModal(false)}
+          onCancel={() => { setShowConfirmModal(false); setConfirmSnapshot(null); }}
         />
       )}
     </div>

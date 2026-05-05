@@ -4,8 +4,9 @@
  * use this data instead of fetching from chain.
  */
 import { PublicKey } from "@solana/web3.js";
-import type { MarketConfig, EngineState, RiskParams, SlabHeader, Account } from "@percolator/sdk";
-import { AccountKind } from "@percolator/sdk";
+import type { MarketConfig, EngineState, RiskParams, SlabHeader, Account } from "@percolatorct/sdk";
+import { AccountKind } from "@percolatorct/sdk";
+import type { PortfolioPosition } from "@/hooks/usePortfolio";
 
 interface MockMarketData {
   symbol: string;
@@ -91,16 +92,21 @@ export function getMockSlabState(address: string) {
 
   const engine: EngineState = {
     vault: m.vault,
-    insuranceFund: { balance: m.insurance, feeRevenue: 0n },
+    insuranceFund: { balance: m.insurance, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
     currentSlot: 300_000_000n,
     fundingIndexQpbE6: 0n,
     lastFundingSlot: 299_999_990n,
     fundingRateBpsPerSlotLast: 0n,
+    fundingRateE9: 0n,
+    marketMode: 0,
     lastCrankSlot: 299_999_995n,
     maxCrankStalenessSlots: 100n,
     totalOpenInterest: m.oi,
+    longOi: m.oi / 2n,
+    shortOi: m.oi / 2n,
     cTot: m.capital,
     pnlPosTot: 0n,
+    pnlMaturedPosTot: 0n,
     liqCursor: 0,
     gcCursor: 0,
     lastSweepStartSlot: 0n,
@@ -113,8 +119,20 @@ export function getMockSlabState(address: string) {
     lpSumAbs: 0n,
     lpMaxAbs: 0n,
     lpMaxAbsSweep: 0n,
+    emergencyOiMode: false,
+    emergencyStartSlot: 0n,
+    lastBreakerSlot: 0n,
+    markPriceE6: priceE6,
+    oraclePriceE6: priceE6,
     numUsedAccounts: m.numAccounts,
     nextAccountId: BigInt(m.numAccounts + 1),
+    fLongNum: 0n,
+    fShortNum: 0n,
+    negPnlAccountCount: 0n,
+    fundPxLast: 0n,
+    resolvedKLongTerminalDelta: 0n,
+    resolvedKShortTerminalDelta: 0n,
+    resolvedLivePrice: 0n,
   } as EngineState;
 
   const params: RiskParams = {
@@ -161,6 +179,27 @@ export function getMockSlabState(address: string) {
       owner: new PublicKey("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"),
       feeCredits: 0n,
       lastFeeSlot: 0n,
+      feesEarnedTotal: 0n,
+      exactReserveCohorts: null,
+      exactCohortCount: null,
+      overflowOlder: null,
+      overflowOlderPresent: null,
+      overflowNewest: null,
+      overflowNewestPresent: null,
+      fSnap: 0n,
+      adlABasis: 0n,
+      adlKSnap: 0n,
+      adlEpochSnap: 0n,
+      schedPresent: null,
+      schedRemainingQ: null,
+      schedAnchorQ: null,
+      schedStartSlot: null,
+      schedHorizon: null,
+      schedReleaseQ: null,
+      pendingPresent: null,
+      pendingRemainingQ: null,
+      pendingHorizon: null,
+      pendingCreatedSlot: null,
     } as Account,
   });
 
@@ -220,6 +259,27 @@ export function getMockUserAccount(address: string) {
       owner: new PublicKey("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"),
       feeCredits: 0n,
       lastFeeSlot: 0n,
+      feesEarnedTotal: 0n,
+      exactReserveCohorts: null,
+      exactCohortCount: null,
+      overflowOlder: null,
+      overflowOlderPresent: null,
+      overflowNewest: null,
+      overflowNewestPresent: null,
+      fSnap: 0n,
+      adlABasis: 0n,
+      adlKSnap: 0n,
+      adlEpochSnap: 0n,
+      schedPresent: null,
+      schedRemainingQ: null,
+      schedAnchorQ: null,
+      schedStartSlot: null,
+      schedHorizon: null,
+      schedReleaseQ: null,
+      pendingPresent: null,
+      pendingRemainingQ: null,
+      pendingHorizon: null,
+      pendingCreatedSlot: null,
     } as Account,
   };
 }
@@ -247,6 +307,27 @@ export function getMockUserAccountIdle(address: string) {
       owner: new PublicKey("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"),
       feeCredits: 0n,
       lastFeeSlot: 0n,
+      feesEarnedTotal: 0n,
+      exactReserveCohorts: null,
+      exactCohortCount: null,
+      overflowOlder: null,
+      overflowOlderPresent: null,
+      overflowNewest: null,
+      overflowNewestPresent: null,
+      fSnap: 0n,
+      adlABasis: 0n,
+      adlKSnap: 0n,
+      adlEpochSnap: 0n,
+      schedPresent: null,
+      schedRemainingQ: null,
+      schedAnchorQ: null,
+      schedStartSlot: null,
+      schedHorizon: null,
+      schedReleaseQ: null,
+      pendingPresent: null,
+      pendingRemainingQ: null,
+      pendingHorizon: null,
+      pendingCreatedSlot: null,
     } as Account,
   };
 }
@@ -285,8 +366,8 @@ export function getMockTrades(address: string) {
 
 /* ── Mock portfolio positions ── */
 
-export function getMockPortfolioPositions() {
-  const positions = [];
+export function getMockPortfolioPositions(): PortfolioPosition[] {
+  const positions: PortfolioPosition[] = [];
   const slabs = Object.entries(MOCK_MAP);
   // Pick a subset that have open positions
   const withPositions = slabs.filter((_, i) => i < 4);
@@ -301,10 +382,34 @@ export function getMockPortfolioPositions() {
     const capital: bigint = BigInt(Math.round((500 + positions.length * 200) * 1_000_000));
     const mintPk = (() => { try { return new PublicKey(m.mint); } catch { return PublicKey.default; } })();
 
+    // Compute enriched fields that PortfolioPosition requires
+    const absPosSize = posSize < 0n ? -posSize : posSize;
+    const notional = Number(absPosSize) / 1e6 * Number(priceE6) / 1e6;
+    const capitalNum = Number(capital) / 1e6;
+    const leverage = capitalNum > 0 ? notional / capitalNum : 0;
+    const pnlNum = Number(pnl) / 1e6;
+    const pnlPercent = capitalNum > 0 ? (pnlNum / capitalNum) * 100 : 0;
+    const maintenanceBps = BigInt(m.initialMarginBps / 2);
+    // Mock liquidation: assume liq at 80% loss for longs, 120% gain for shorts
+    const liqFactor = isLong ? 0.2 : 1.8;
+    const liquidationPriceE6 = BigInt(Math.round(m.priceUsd * liqFactor * 1_000_000));
+    const liqDist = isLong
+      ? (Number(priceE6 - liquidationPriceE6) / Number(priceE6)) * 100
+      : (Number(liquidationPriceE6 - priceE6) / Number(priceE6)) * 100;
+    const liquidationDistancePct = Math.max(0, Math.min(100, liqDist));
+
     positions.push({
       slabAddress: slabAddr,
       symbol: m.symbol,
       idx: 2,
+      effectiveEntryPrice: entryE6,
+      oraclePriceE6: priceE6,
+      liquidationPriceE6,
+      liquidationDistancePct,
+      unrealizedPnl: pnl,
+      pnlPercent,
+      leverage,
+      maintenanceMarginBps: maintenanceBps,
       account: {
         kind: AccountKind.User,
         accountId: BigInt(positions.length + 1),
@@ -321,6 +426,27 @@ export function getMockPortfolioPositions() {
         owner: new PublicKey("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"),
         feeCredits: 0n,
         lastFeeSlot: 0n,
+        feesEarnedTotal: 0n,
+        exactReserveCohorts: null,
+        exactCohortCount: null,
+        overflowOlder: null,
+        overflowOlderPresent: null,
+        overflowNewest: null,
+        overflowNewestPresent: null,
+        fSnap: 0n,
+        adlABasis: 0n,
+        adlKSnap: 0n,
+        adlEpochSnap: 0n,
+        schedPresent: null,
+        schedRemainingQ: null,
+        schedAnchorQ: null,
+        schedStartSlot: null,
+        schedHorizon: null,
+        schedReleaseQ: null,
+        pendingPresent: null,
+        pendingRemainingQ: null,
+        pendingHorizon: null,
+        pendingCreatedSlot: null,
       } as Account,
       market: {
         slabAddress: new PublicKey(slabAddr),
@@ -338,7 +464,7 @@ export function getMockPortfolioPositions() {
         } as any,
         params: {
           initialMarginBps: BigInt(m.initialMarginBps),
-          maintenanceMarginBps: BigInt(m.initialMarginBps / 2),
+          maintenanceMarginBps: maintenanceBps,
           tradingFeeBps: BigInt(m.tradingFeeBps),
         } as any,
       },

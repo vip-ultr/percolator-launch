@@ -1,17 +1,25 @@
 /**
- * Permissionless market factory - creates a new Percolator perpetual market
- * for any SPL token.
+ * Production Market Creation Script — Percolator
+ *
+ * Executes six transactions in sequence to bootstrap a new SOL/USDC perp market:
+ *   TX1: InitMarket — allocate slab + initialize market with RiskParams (370 bytes)
+ *   TX2: SetDexPool — pin the Raydium/PumpSwap DEX pool for the Hyperp oracle
+ *   TX3: InitLP     — initialize LP slot 0 with seed deposit
+ *   TX4: InitMatcherCtx — CPI-initialize the matcher context for LP 0
+ *   TX5: TopUpInsurance — optional; seed the insurance fund
  *
  * Usage:
- *   npx tsx scripts/create-market.ts \
- *     --mint <SPL_MINT> --initial-price <E6> \
- *     --lp-collateral <AMOUNT> --insurance <AMOUNT> \
- *     [--oracle-feed <HEX64>] [--invert] [--trading-fee-bps N] [--initial-margin-bps N]
+ *   npx tsx scripts/create-market.ts [--network mainnet|devnet] [--keypair /path/to/key.json]
  *
- * Prerequisites:
- *   - .env with RPC_URL and ADMIN_KEYPAIR_PATH
- *   - Admin keypair funded with SOL for tx fees
- *   - Admin has tokens of the specified mint for LP collateral + insurance
+ * Environment variables (override CLI args):
+ *   RPC_URL          — Solana RPC endpoint
+ *   KEYPAIR_PATH     — Path to admin keypair JSON
+ *   NETWORK          — "mainnet" | "devnet"
+ *   COLLATERAL_MINT  — Override USDC mint address
+ *   DEX_POOL         — DEX pool address for Hyperp oracle
+ *   INITIAL_PRICE_E6 — Initial mark price in e6 units (default: 150_000_000 = $150)
+ *   SEED_DEPOSIT     — LP seed deposit in USDC atomic units (default: 250_000_000 = 250 USDC)
+ *   INSURANCE_AMOUNT — Insurance fund seed (default: 0, skips TX5)
  */
 
 import {
@@ -19,6 +27,7 @@ import {
   Keypair,
   PublicKey,
   Transaction,
+  TransactionInstruction,
   sendAndConfirmTransaction,
   ComputeBudgetProgram,
   SystemProgram,
@@ -26,410 +35,806 @@ import {
   SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
-  getOrCreateAssociatedTokenAccount,
   TOKEN_PROGRAM_ID,
+  MINT_SIZE,
+  ACCOUNT_SIZE as TOKEN_ACCOUNT_SIZE,
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
 import * as fs from "fs";
-import * as dotenv from "dotenv";
-import { parseArgs } from "node:util";
+import * as path from "path";
+
+// SDK encoders — these are the canonical source of truth for instruction layout.
+// encodeInitMarket produces the deployed v12.19 wire format: 304-byte base +
+// mandatory 66-byte extended tail.
 import {
   encodeInitMarket,
+  encodeSetDexPool,
   encodeInitLP,
-  encodeDepositCollateral,
+  encodeInitMatcherCtx,
   encodeTopUpInsurance,
-  encodeKeeperCrank,
-  encodeSetOracleAuthority,
-  encodePushOraclePrice,
-} from "../packages/core/src/abi/instructions.js";
+  SLAB_TIERS_V12_19,
+} from "@percolatorct/sdk";
 import {
+  buildAccountMetas,
   ACCOUNTS_INIT_MARKET,
   ACCOUNTS_INIT_LP,
-  ACCOUNTS_DEPOSIT_COLLATERAL,
+  ACCOUNTS_INIT_MATCHER_CTX,
   ACCOUNTS_TOPUP_INSURANCE,
-  ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_SET_ORACLE_AUTHORITY,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
-  buildAccountMetas,
-} from "../packages/core/src/abi/accounts.js";
-import { deriveVaultAuthority, derivePythPushOraclePDA } from "../packages/core/src/solana/pda.js";
-import { buildIx } from "../packages/core/src/runtime/tx.js";
-import { SLAB_TIERS } from "../packages/core/src/solana/discovery.js";
-
-dotenv.config();
+} from "@percolatorct/sdk";
 
 // ============================================================================
-// CLI ARGS
+// Program IDs
 // ============================================================================
 
-const { values: args } = parseArgs({
-  options: {
-    mint: { type: "string" },
-    "initial-price": { type: "string" },
-    "lp-collateral": { type: "string" },
-    insurance: { type: "string" },
-    "oracle-feed": { type: "string" },
-    invert: { type: "boolean", default: false },
-    "trading-fee-bps": { type: "string", default: "30" },
-    "initial-margin-bps": { type: "string", default: "1000" },
-  },
-  strict: true,
-});
+const PROGRAM_ID_MAINNET = new PublicKey(
+  "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+);
+const PROGRAM_ID_DEVNET = new PublicKey(
+  "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",
+);
+const MATCHER_PROG_ID = new PublicKey(
+  "GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi",
+);
+const STAKE_PROG_ID = new PublicKey(
+  "DC5fovFQD5SZYsetwvEqd4Wi4PFY1Yfnc669VMe6oa7F",
+);
 
-if (!args.mint) throw new Error("--mint is required");
-if (!args["initial-price"]) throw new Error("--initial-price is required");
-if (!args["lp-collateral"]) throw new Error("--lp-collateral is required");
-if (!args.insurance) throw new Error("--insurance is required");
-
-const MINT = new PublicKey(args.mint);
-const INITIAL_PRICE_E6 = BigInt(args["initial-price"]);
-const LP_COLLATERAL = BigInt(args["lp-collateral"]);
-const INSURANCE_AMOUNT = BigInt(args.insurance);
-const ORACLE_FEED = args["oracle-feed"] ?? "0".repeat(64); // all zeros = admin oracle
-const INVERT = args.invert ? 1 : 0;
-const TRADING_FEE_BPS = BigInt(args["trading-fee-bps"]!);
-const INITIAL_MARGIN_BPS = BigInt(args["initial-margin-bps"]!);
-const IS_ADMIN_ORACLE = ORACLE_FEED === "0".repeat(64);
+const USDC_MAINNET = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+);
+const USDC_DEVNET = new PublicKey(
+  "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+);
 
 // ============================================================================
-// CONSTANTS
+// Slab constants
 // ============================================================================
 
-const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID || "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24");
-// PERC-381: Use canonical slab size from SLAB_TIERS (large = 4096 accounts).
-// Previous value 992_560 was stale and caused 0x4 InvalidSlabLen errors.
-const SLAB_SIZE = SLAB_TIERS.large.dataSize;
-const PRIORITY_FEE = 50_000;
+// v12.19 small-tier slab size — use the SDK's probe-confirmed deployed
+// mainnet shape to avoid drifting from the wrapper's slab_shape_guard.
+const SLAB_SIZE_SMALL = SLAB_TIERS_V12_19.small.dataSize;
 
-// Safety: assert slab size hasn't drifted from expected value
-if (SLAB_SIZE !== 1_025_832) {
-  throw new Error(`SLAB_TIERS.large.dataSize changed to ${SLAB_SIZE} — update create-market.ts and verify on-chain program compatibility`);
+// Matcher context account size (fixed, per matcher program)
+const MATCHER_CTX_SIZE = 320;
+
+// ============================================================================
+// RiskParams defaults — SOL/USDC perp (Hyperp oracle mode)
+// ============================================================================
+
+const DEFAULT_RISK_PARAMS = {
+  hMin:                   150n,            // warmup horizon min ~1 minute at 2.5s/slot (v12.15: replaces warmupPeriodSlots)
+  hMax:                   600n,            // warmup horizon max ~4 minutes (v12.15: overflow segment horizon)
+  maintenanceMarginBps:   500n,            // 5%
+  initialMarginBps:       1000n,           // 10% = 10x max leverage
+  tradingFeeBps:          10n,             // 0.1%
+  maxAccounts:            256n,            // small tier (v12.15: was 1024)
+  newAccountFee:          1_000_000n,      // 1 USDC (u128)
+  maintenanceFeePerSlot:  0n,              // v12.19 encoder type requires this; wrapper ignores the old wire slot
+  maxCrankStalenessSlots: 300n,            // 5 minutes
+  liquidationFeeBps:      50n,             // 0.5%
+  liquidationFeeCap:      100_000_000n,    // 100 USDC (u128)
+  minLiquidationAbs:      100n,            // lowered from 1_000_000 (u128)
+  minInitialDeposit:      2_000_000n,      // 2 USDC (u128) — lowered to be inclusive on launch
+  minNonzeroMmReq:        100_000n,        // 0.1 USDC — must be > 0 (u128)
+  minNonzeroImReq:        500_000n,        // 0.5 USDC — must be > mmReq, <= minInitialDeposit (u128)
+  insuranceFloor:         0n,              // no floor (u128)
+} as const;
+
+// Fields between header and RiskParams (immutable after init)
+const DEFAULT_INIT_EXTRA = {
+  maxInsuranceFloor:        1_000_000_000_000n, // 1M USDC ceiling (u128, must be > 0)
+  minOraclePriceCap:        500n,          // 5% min price cap (u64, e2bps)
+} as const;
+
+// InitMatcherCtx defaults — passive vAMM for LP slot 0
+const DEFAULT_MATCHER_CTX = {
+  lpIdx:                0,
+  kind:                 0,        // Passive
+  tradingFeeBps:        30,       // 0.30%
+  baseSpreadBps:        10,
+  maxTotalBps:          200,
+  impactKBps:           100,
+  liquidityNotionalE6:  1_000_000_000n,          // $1,000 notional
+  maxFillAbs:           100_000_000_000_000n,     // very large = no per-fill limit
+  maxInventoryAbs:      10_000_000n,              // 10 USDC max inventory
+  feeToInsuranceBps:    2000,
+  skewSpreadMultBps:    5000,
+} as const;
+
+// ============================================================================
+// CLI / env config
+// ============================================================================
+
+interface MarketConfig {
+  network: "mainnet" | "devnet";
+  rpcUrl: string;
+  keypairPath: string;
+  collateralMint: PublicKey;
+  programId: PublicKey;
+  dexPoolAddress: PublicKey;
+  initialMarkPriceE6: bigint;
+  seedDepositAmount: bigint;
+  insuranceAmount: bigint;
+  slabSize: number;
+}
+
+function parseArgs(): MarketConfig {
+  const argv = process.argv.slice(2);
+  const get = (flag: string): string | undefined => {
+    const idx = argv.indexOf(flag);
+    return idx !== -1 ? argv[idx + 1] : undefined;
+  };
+
+  const network = (get("--network") ?? process.env.NETWORK ?? "mainnet") as
+    | "mainnet"
+    | "devnet";
+
+  const defaultRpc =
+    network === "mainnet"
+      ? "https://api.mainnet-beta.solana.com"
+      : "https://api.devnet.solana.com";
+
+  const rpcUrl = get("--rpc") ?? process.env.RPC_URL ?? defaultRpc;
+
+  const keypairPath =
+    get("--keypair") ??
+    process.env.KEYPAIR_PATH ??
+    path.join(
+      process.env.HOME!,
+      ".percolator-mainnet",
+      "keys",
+      "deploy-authority.json",
+    );
+
+  const collateralMintStr =
+    get("--collateral-mint") ?? process.env.COLLATERAL_MINT;
+  const collateralMint = collateralMintStr
+    ? new PublicKey(collateralMintStr)
+    : network === "mainnet"
+      ? USDC_MAINNET
+      : USDC_DEVNET;
+
+  const programId =
+    network === "mainnet" ? PROGRAM_ID_MAINNET : PROGRAM_ID_DEVNET;
+
+  const dexPoolStr =
+    get("--dex-pool") ?? process.env.DEX_POOL;
+  if (!dexPoolStr) {
+    console.error(
+      "ERROR: --dex-pool or DEX_POOL env var is required (Raydium/PumpSwap pool address)",
+    );
+    process.exit(1);
+  }
+  const dexPoolAddress = new PublicKey(dexPoolStr);
+
+  const initialMarkPriceE6 = BigInt(
+    get("--initial-price-e6") ?? process.env.INITIAL_PRICE_E6 ?? "0",
+  );
+
+  const seedDepositAmount = BigInt(
+    get("--seed-deposit") ?? process.env.SEED_DEPOSIT ?? "250000000",
+  );
+
+  const insuranceAmount = BigInt(
+    get("--insurance") ?? process.env.INSURANCE_AMOUNT ?? "0",
+  );
+
+  const slabSize = SLAB_SIZE_SMALL;
+
+  return {
+    network,
+    rpcUrl,
+    keypairPath,
+    collateralMint,
+    programId,
+    dexPoolAddress,
+    initialMarkPriceE6,
+    seedDepositAmount,
+    insuranceAmount,
+    slabSize,
+  };
 }
 
 // ============================================================================
-// HELPERS
+// Helpers
 // ============================================================================
 
-function loadKeypair(path: string): Keypair {
-  const resolved = path.startsWith("~/")
-    ? path.replace("~", process.env.HOME || "")
-    : path;
-  const raw = fs.readFileSync(resolved, "utf-8");
+function redactRpcUrl(rpcUrl: string): string {
+  return rpcUrl.replace(/([?&]api-key=)[^&]+/i, "$1<redacted>");
+}
+
+function loadKeypair(p: string): Keypair {
+  const raw = fs.readFileSync(p, "utf8");
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
 }
 
-function addPriorityFee(tx: Transaction): void {
-  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE }));
+/**
+ * Persist a freshly-generated keypair to disk before any tx fires that
+ * depends on it. Even though the keypairs become moot once the matching
+ * createAccount lands (atomic within tx), saving them gives us an audit
+ * trail and a recovery handle if the runtime crashes mid-flow.
+ */
+function saveKeypairBackup(name: string, kp: Keypair, dir: string): void {
+  const filePath = path.join(dir, `${name}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(Array.from(kp.secretKey)), { mode: 0o600 });
+  console.log(`  saved keypair: ${filePath} (pubkey ${kp.publicKey.toBase58()})`);
+}
+
+async function sendTx(
+  conn: Connection,
+  tx: Transaction,
+  signers: Keypair[],
+  label: string,
+): Promise<string> {
+  const { blockhash, lastValidBlockHeight } =
+    await conn.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = signers[0].publicKey;
+
+  const sim = await conn.simulateTransaction(tx, signers);
+  console.log(`  ${label} simulation CU: ${sim.value.unitsConsumed ?? "unknown"}`);
+  if (sim.value.err) {
+    console.error(`  ${label} simulation failed:`, JSON.stringify(sim.value.err));
+    for (const log of sim.value.logs ?? []) console.error(`    ${log}`);
+    throw new Error(`${label} simulation failed`);
+  }
+
+  const sig = await sendAndConfirmTransaction(conn, tx, signers, {
+    commitment: "confirmed",
+    maxRetries: 3,
+  });
+
+  console.log(`  ${label}: https://solscan.io/tx/${sig}`);
+  return sig;
 }
 
 // ============================================================================
-// MAIN
+// Main
 // ============================================================================
 
 async function main() {
-  console.log("\n" + "=".repeat(70));
-  console.log("PERCOLATOR - CREATE NEW MARKET");
-  console.log("=".repeat(70));
+  const cfg = parseArgs();
 
-  const rpcUrl = process.env.RPC_URL;
-  if (!rpcUrl) throw new Error("RPC_URL not set in .env");
+  console.log("========== Percolator Market Creation ==========");
+  console.log(`Network:         ${cfg.network}`);
+  console.log(`RPC:             ${redactRpcUrl(cfg.rpcUrl)}`);
+  console.log(`Admin keypair:   ${cfg.keypairPath}`);
+  console.log(`Program:         ${cfg.programId.toBase58()}`);
+  console.log(`Collateral mint: ${cfg.collateralMint.toBase58()}`);
+  console.log(`DEX pool:        ${cfg.dexPoolAddress.toBase58()}`);
+  console.log(`Initial price:   ${cfg.initialMarkPriceE6 === 0n ? "(will fetch from DEX pool)" : "$" + (Number(cfg.initialMarkPriceE6) / 1_000_000).toFixed(2)}`);
+  console.log(`Seed deposit:    ${Number(cfg.seedDepositAmount) / 1_000_000} USDC`);
+  console.log(
+    `Insurance seed:  ${Number(cfg.insuranceAmount) / 1_000_000} USDC${cfg.insuranceAmount === 0n ? " (skipping TX5)" : ""}`,
+  );
+  console.log("================================================\n");
 
-  const keypairPath = process.env.ADMIN_KEYPAIR_PATH || "./admin-keypair.json";
-  const payer = loadKeypair(keypairPath);
-  const connection = new Connection(rpcUrl, "confirmed");
+  const conn = new Connection(cfg.rpcUrl, "confirmed");
+  const admin = loadKeypair(cfg.keypairPath);
+  console.log(`Admin public key: ${admin.publicKey.toBase58()}`);
 
-  console.log(`\nRPC: ${rpcUrl.replace(/api-key=.*/, "api-key=***")}`);
-  console.log(`Admin: ${payer.publicKey.toBase58()}`);
-  console.log(`Mint: ${MINT.toBase58()}`);
-  console.log(`Program: ${PROGRAM_ID.toBase58()}`);
-  if (IS_ADMIN_ORACLE) {
-    console.log(`Oracle: Admin (permissioned push)`);
-  } else {
-    const [pythPDA] = derivePythPushOraclePDA(ORACLE_FEED);
-    console.log(`Oracle: Pyth Push Oracle`);
-    console.log(`  Feed ID: ${ORACLE_FEED}`);
-    console.log(`  Push Oracle PDA: ${pythPDA.toBase58()}`);
+  // Pre-flight checks
+  const adminSol = await conn.getBalance(admin.publicKey);
+  console.log(`Admin SOL:        ${(adminSol / 1e9).toFixed(4)} SOL`);
+  const adminAtaInfo = await conn.getAccountInfo(
+    await getAssociatedTokenAddress(cfg.collateralMint, admin.publicKey),
+  );
+  const adminUsdc = adminAtaInfo
+    ? Number(Buffer.from(adminAtaInfo.data).readBigUInt64LE(64)) / 1e6
+    : 0;
+  console.log(`Admin USDC:       ${adminUsdc.toFixed(2)} USDC`);
+  const neededUsdc = Number(cfg.seedDepositAmount + cfg.insuranceAmount) / 1e6;
+  if (adminUsdc < neededUsdc) {
+    console.error(`ERROR: Need ${neededUsdc} USDC but only have ${adminUsdc.toFixed(2)}. Fund the wallet first.`);
+    process.exit(1);
   }
-  console.log(`Inverted: ${INVERT ? "Yes" : "No"}`);
-  console.log(`Trading Fee: ${TRADING_FEE_BPS} bps`);
-  console.log(`Initial Margin: ${INITIAL_MARGIN_BPS} bps`);
-  console.log(`Initial Price (e6): ${INITIAL_PRICE_E6}`);
 
-  const balance = await connection.getBalance(payer.publicKey);
-  console.log(`Balance: ${(balance / 1e9).toFixed(4)} SOL\n`);
+  // Fetch live price from DEX pool if not overridden
+  let markPriceE6 = cfg.initialMarkPriceE6;
+  if (markPriceE6 === 0n) {
+    console.log("Fetching live SOL price from DEX pool...");
+    const poolInfo = await conn.getAccountInfo(cfg.dexPoolAddress);
+    if (!poolInfo) throw new Error("DEX pool not found on-chain");
+    // Raydium CLMM: sqrt_price_x64 (u128) at offset 253
+    const sqrtLo = poolInfo.data.readBigUInt64LE(253) as bigint;
+    const sqrtHi = poolInfo.data.readBigUInt64LE(261) as bigint;
+    const sqrtPriceX64 = sqrtLo + (sqrtHi << 64n);
+    const sqrtFloat = Number(sqrtPriceX64) / 2 ** 64;
+    const rawPrice = sqrtFloat * sqrtFloat;
+    // rawPrice = token1/token0 in native units (no decimal adjustment)
+    // For SOL(9 decimals) / USDC(6 decimals): USDC_per_SOL = rawPrice * 10^(9-6) = rawPrice * 1000
+    const priceUsd = rawPrice * 1000;
+    markPriceE6 = BigInt(Math.round(priceUsd * 1_000_000));
+    console.log(`  Live SOL price: $${priceUsd.toFixed(2)} (${markPriceE6} e6)`);
+  }
 
-  // ========================================================================
-  // TX 1: Create slab account + vault ATA + InitMarket
-  // ========================================================================
-  console.log("Step 1: Creating slab account + InitMarket...");
+  // Pre-tx backup directory: stash all generated keypairs here before any
+  // tx fires. Survives mid-flow crashes; recoverable by close-orphan-slab.ts.
+  const backupDir = path.join(
+    process.env.HOME!,
+    ".percolator-mainnet",
+    "markets",
+    `${cfg.network}-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+  );
+  fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+  console.log(`Keypair backup dir: ${backupDir}\n`);
 
-  const slabKp = Keypair.generate();
-  const slabRent = await connection.getMinimumBalanceForRentExemption(SLAB_SIZE);
-  console.log(`  Slab: ${slabKp.publicKey.toBase58()}`);
-  console.log(`  Rent: ${(slabRent / 1e9).toFixed(4)} SOL`);
+  // Generate fresh keypairs for slab and matcher context
+  const slab = Keypair.generate();
+  const matcherCtx = Keypair.generate();
 
-  // Create slab account (separate tx due to size limits)
-  const createSlabTx = new Transaction();
-  addPriorityFee(createSlabTx);
-  createSlabTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }));
-  createSlabTx.add(
+  saveKeypairBackup("slab", slab, backupDir);
+  saveKeypairBackup("matcher-ctx", matcherCtx, backupDir);
+
+  // Derive vault PDA
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), slab.publicKey.toBuffer()],
+    cfg.programId,
+  );
+
+  // Derive LP slot 0 PDA
+  const lpIdxBuf = Buffer.alloc(2);
+  lpIdxBuf.writeUInt16LE(0, 0);
+  const [lpPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("lp"), slab.publicKey.toBuffer(), lpIdxBuf],
+    cfg.programId,
+  );
+
+  // ATAs
+  const vaultAta = await getAssociatedTokenAddress(
+    cfg.collateralMint,
+    vaultPda,
+    true, // allowOwnerOffCurve=true for PDAs
+  );
+  const adminAta = await getAssociatedTokenAddress(
+    cfg.collateralMint,
+    admin.publicKey,
+  );
+
+  console.log(`Slab:            ${slab.publicKey.toBase58()}`);
+  console.log(`Matcher ctx:     ${matcherCtx.publicKey.toBase58()}`);
+  console.log(`Vault PDA:       ${vaultPda.toBase58()}`);
+  console.log(`Vault ATA:       ${vaultAta.toBase58()}`);
+  console.log(`LP PDA (idx=0):  ${lpPda.toBase58()}`);
+  console.log();
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX1: InitMarket
+  //   - SystemProgram.createAccount (slab, SLAB_SIZE bytes, rent-exempt)
+  //   - Create vault ATA if needed
+  //   - InitMarket instruction (370 bytes — v12.19 base 304 + 66-byte tail)
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log("TX1: InitMarket (create slab + init market with RiskParams)...");
+
+  const slabRent = await conn.getMinimumBalanceForRentExemption(cfg.slabSize);
+
+  const initMarketData = encodeInitMarket({
+    admin: admin.publicKey,
+    collateralMint: cfg.collateralMint,
+    // Hyperp mode: all-zeros feed ID (program validates against DEX pool set in TX2)
+    indexFeedId:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    // maxStalenessSecs: not used in Hyperp mode but required field
+    maxStalenessSecs: 120n,
+    confFilterBps: 0,
+    invert: 0,
+    unitScale: 0,
+    initialMarkPriceE6: markPriceE6,
+    ...DEFAULT_INIT_EXTRA,
+    ...DEFAULT_RISK_PARAMS,
+  });
+
+  // Log instruction size for audit trail. The SDK's own encoder validates length
+  // internally — this message helps catch SDK version drift when reviewing logs.
+  console.log(
+    `  encodeInitMarket: ${initMarketData.length} bytes ` +
+      `(expected 370 — v12.19 base 304 + 66-byte mandatory extended tail)`,
+  );
+
+  const tx1 = new Transaction();
+  tx1.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
+  tx1.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  // Create the slab account (program-owned, rent-exempt)
+  tx1.add(
     SystemProgram.createAccount({
-      fromPubkey: payer.publicKey,
-      newAccountPubkey: slabKp.publicKey,
+      fromPubkey: admin.publicKey,
+      newAccountPubkey: slab.publicKey,
       lamports: slabRent,
-      space: SLAB_SIZE,
-      programId: PROGRAM_ID,
+      space: cfg.slabSize,
+      programId: cfg.programId,
     }),
   );
-  await sendAndConfirmTransaction(connection, createSlabTx, [payer, slabKp], {
-    commitment: "confirmed",
-  });
-  console.log("  Slab account created");
-
-  // Derive vault PDA and create vault ATA
-  const [vaultPda] = deriveVaultAuthority(PROGRAM_ID, slabKp.publicKey);
-  const vaultAccount = await getOrCreateAssociatedTokenAccount(
-    connection, payer, MINT, vaultPda, true,
+  // Create vault ATA if it doesn't exist
+  tx1.add(
+    createAssociatedTokenAccountInstruction(
+      admin.publicKey,
+      vaultAta,
+      vaultPda,
+      cfg.collateralMint,
+    ),
   );
-  const vault = vaultAccount.address;
-  console.log(`  Vault PDA: ${vaultPda.toBase58()}`);
-  console.log(`  Vault ATA: ${vault.toBase58()}`);
-
-  // Admin ATA
-  const adminAta = await getOrCreateAssociatedTokenAccount(
-    connection, payer, MINT, payer.publicKey,
+  // InitMarket instruction (tag 0)
+  // 9 accounts: [0] admin, [1] slab, [2] mint, [3] vault, [4] tokenProgram,
+  //   [5] clock, [6] rent, [7] dummyAta, [8] systemProgram
+  tx1.add(
+    new TransactionInstruction({
+      programId: cfg.programId,
+      keys: buildAccountMetas(ACCOUNTS_INIT_MARKET, {
+        admin: admin.publicKey,
+        slab: slab.publicKey,
+        mint: cfg.collateralMint,
+        vault: vaultAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        clock: SYSVAR_CLOCK_PUBKEY,
+        rent: SYSVAR_RENT_PUBKEY,
+        dummyAta: adminAta,
+        systemProgram: SystemProgram.programId,
+      }),
+      data: Buffer.from(initMarketData),
+    }),
   );
 
-  // InitMarket
-  const initMarketData = encodeInitMarket({
-    admin: payer.publicKey,
-    collateralMint: MINT,
-    indexFeedId: ORACLE_FEED,
-    maxStalenessSecs: "50",
-    confFilterBps: 0,
-    invert: INVERT,
-    unitScale: 0,
-    initialMarkPriceE6: INITIAL_PRICE_E6.toString(),
-    warmupPeriodSlots: "0",
-    maintenanceMarginBps: (INITIAL_MARGIN_BPS / 2n).toString(), // MM = half IM
-    initialMarginBps: INITIAL_MARGIN_BPS.toString(),
-    tradingFeeBps: TRADING_FEE_BPS.toString(),
-    maxAccounts: "4096",
-    newAccountFee: "1000000", // 1 token (assuming 6 decimals)
-    riskReductionThreshold: "0",
-    maintenanceFeePerSlot: "0",
-    maxCrankStalenessSlots: "100",
-    liquidationFeeBps: "100", // 1%
-    liquidationFeeCap: "0",
-    liquidationBufferBps: "50",
-    minLiquidationAbs: "0",
-  });
+  let sig1: string;
+  try {
+    sig1 = await sendTx(conn, tx1, [admin, slab], "TX1");
+  } catch (e) {
+    console.error("TX1 FAILED (InitMarket):", e instanceof Error ? e.message : e);
+    console.error("Nothing was created on-chain — safe to retry.");
+    process.exit(1);
+  }
 
-  const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
-    payer.publicKey,
-    slabKp.publicKey,
-    MINT,
-    vault,
-    TOKEN_PROGRAM_ID,
-    SYSVAR_CLOCK_PUBKEY,
-    SYSVAR_RENT_PUBKEY,
-    vault, // dummyAta
-    SystemProgram.programId,
-  ]);
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX2: SetDexPool — pin the DEX pool for Hyperp oracle
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log("TX2: SetDexPool (pin DEX pool for Hyperp oracle)...");
 
-  const initMarketTx = new Transaction();
-  addPriorityFee(initMarketTx);
-  initMarketTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
-  initMarketTx.add(buildIx({ programId: PROGRAM_ID, keys: initMarketKeys, data: initMarketData }));
-  await sendAndConfirmTransaction(connection, initMarketTx, [payer], { commitment: "confirmed" });
-  console.log("  Market initialized");
+  const tx2 = new Transaction();
+  tx2.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
+  tx2.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  tx2.add(
+    new TransactionInstruction({
+      programId: cfg.programId,
+      keys: [
+        { pubkey: admin.publicKey, isSigner: true, isWritable: false },
+        { pubkey: slab.publicKey, isSigner: false, isWritable: true },
+        { pubkey: cfg.dexPoolAddress, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from(encodeSetDexPool({ pool: cfg.dexPoolAddress })),
+    }),
+  );
 
-  // ========================================================================
-  // TX 2: InitLP (passive) + DepositCollateral + TopUpInsurance
-  // ========================================================================
-  console.log("\nStep 2: Setting up LP + Insurance...");
+  let sig2: string;
+  try {
+    sig2 = await sendTx(conn, tx2, [admin], "TX2");
+  } catch (e) {
+    console.error("TX2 FAILED (SetDexPool):", e instanceof Error ? e.message : e);
+    console.error(
+      `Slab created: ${slab.publicKey.toBase58()} — use close-orphan-slab.ts to reclaim rent.`,
+    );
+    process.exit(1);
+  }
 
-  // InitLP with SystemProgram as passive matcher (no CPI matcher needed)
-  const initLpData = encodeInitLP({
-    matcherProgram: SystemProgram.programId,
-    matcherContext: SystemProgram.programId,
-    feePayment: "0",
-  });
-  const initLpKeys = buildAccountMetas(ACCOUNTS_INIT_LP, [
-    payer.publicKey,
-    slabKp.publicKey,
-    adminAta.address,
-    vault,
-    TOKEN_PROGRAM_ID,
-  ]);
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX3: InitLP — initialize LP slot 0 with seed deposit
+  //   Also creates the matcher context keypair account.
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log(
+    `TX3: InitLP (seed deposit: ${Number(cfg.seedDepositAmount) / 1_000_000} USDC)...`,
+  );
 
-  const initLpTx = new Transaction();
-  addPriorityFee(initLpTx);
-  initLpTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
-  initLpTx.add(buildIx({ programId: PROGRAM_ID, keys: initLpKeys, data: initLpData }));
-  await sendAndConfirmTransaction(connection, initLpTx, [payer], { commitment: "confirmed" });
-  console.log("  LP initialized at index 0");
+  const ctxRent = await conn.getMinimumBalanceForRentExemption(MATCHER_CTX_SIZE);
 
-  // Deposit collateral to LP
-  const depositData = encodeDepositCollateral({
-    userIdx: 0,
-    amount: LP_COLLATERAL.toString(),
-  });
-  const depositKeys = buildAccountMetas(ACCOUNTS_DEPOSIT_COLLATERAL, [
-    payer.publicKey,
-    slabKp.publicKey,
-    adminAta.address,
-    vault,
-    TOKEN_PROGRAM_ID,
-    SYSVAR_CLOCK_PUBKEY,
-  ]);
+  const tx3 = new Transaction();
+  tx3.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }));
+  tx3.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  // Pre-allocate the matcher context account (InitMatcherCtx in TX4 will fill it)
+  tx3.add(
+    SystemProgram.createAccount({
+      fromPubkey: admin.publicKey,
+      newAccountPubkey: matcherCtx.publicKey,
+      lamports: ctxRent,
+      space: MATCHER_CTX_SIZE,
+      programId: MATCHER_PROG_ID,
+    }),
+  );
+  // InitLP instruction (tag 2): connects LP slot to matcher, transfers seed deposit
+  // 6 accounts: [user(signer,writable), slab(writable), userAta(writable), vault(writable), tokenProgram, clock]
+  tx3.add(
+    new TransactionInstruction({
+      programId: cfg.programId,
+      keys: [
+        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
+        { pubkey: slab.publicKey, isSigner: false, isWritable: true },
+        { pubkey: adminAta, isSigner: false, isWritable: true },
+        { pubkey: vaultAta, isSigner: false, isWritable: true },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from(
+        encodeInitLP({
+          matcherProgram: MATCHER_PROG_ID,
+          matcherContext: matcherCtx.publicKey,
+          feePayment: cfg.seedDepositAmount,
+        }),
+      ),
+    }),
+  );
 
-  const depositTx = new Transaction();
-  addPriorityFee(depositTx);
-  depositTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
-  depositTx.add(buildIx({ programId: PROGRAM_ID, keys: depositKeys, data: depositData }));
-  await sendAndConfirmTransaction(connection, depositTx, [payer], { commitment: "confirmed" });
-  console.log(`  Deposited ${LP_COLLATERAL} to LP`);
+  let sig3: string;
+  try {
+    sig3 = await sendTx(conn, tx3, [admin, matcherCtx], "TX3");
+  } catch (e) {
+    console.error("TX3 FAILED (InitLP):", e instanceof Error ? e.message : e);
+    console.error(
+      `Slab created: ${slab.publicKey.toBase58()}\n` +
+        `DEX pool set. Use close-orphan-slab.ts if you need to abort.`,
+    );
+    process.exit(1);
+  }
 
-  // Top up insurance fund
-  const topupData = encodeTopUpInsurance({ amount: INSURANCE_AMOUNT.toString() });
-  const topupKeys = buildAccountMetas(ACCOUNTS_TOPUP_INSURANCE, [
-    payer.publicKey,
-    slabKp.publicKey,
-    adminAta.address,
-    vault,
-    TOKEN_PROGRAM_ID,
-  ]);
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX4: InitMatcherCtx — CPI-initialize matcher context for LP 0
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log("TX4: InitMatcherCtx (initialize matcher for LP slot 0)...");
 
-  const topupTx = new Transaction();
-  addPriorityFee(topupTx);
-  topupTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
-  topupTx.add(buildIx({ programId: PROGRAM_ID, keys: topupKeys, data: topupData }));
-  await sendAndConfirmTransaction(connection, topupTx, [payer], { commitment: "confirmed" });
-  console.log(`  Insurance topped up: ${INSURANCE_AMOUNT}`);
+  const tx4 = new Transaction();
+  tx4.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+  tx4.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  tx4.add(
+    new TransactionInstruction({
+      programId: cfg.programId,
+      keys: buildAccountMetas(ACCOUNTS_INIT_MATCHER_CTX, {
+        admin: admin.publicKey,
+        slab: slab.publicKey,
+        matcherCtx: matcherCtx.publicKey,
+        matcherProg: MATCHER_PROG_ID,
+        lpPda,
+      }),
+      data: Buffer.from(encodeInitMatcherCtx(DEFAULT_MATCHER_CTX)),
+    }),
+  );
 
-  // ========================================================================
-  // TX 3: Oracle setup + initial crank
-  // ========================================================================
-  if (IS_ADMIN_ORACLE) {
-    console.log("\nStep 3: Setting up admin oracle...");
+  let sig4: string;
+  try {
+    sig4 = await sendTx(conn, tx4, [admin], "TX4");
+  } catch (e) {
+    console.error(
+      "TX4 FAILED (InitMatcherCtx):",
+      e instanceof Error ? e.message : e,
+    );
+    console.error(
+      `Market is partially initialized. LP slot 0 exists but matcher ctx is not set.\n` +
+        `Slab: ${slab.publicKey.toBase58()}\n` +
+        `Matcher ctx: ${matcherCtx.publicKey.toBase58()}\n` +
+        `Run fix-lp-matcher.ts to retry TX4 only.`,
+    );
+    process.exit(1);
+  }
 
-    // Set oracle authority
-    const setAuthData = encodeSetOracleAuthority({ newAuthority: payer.publicKey });
-    const setAuthKeys = buildAccountMetas(ACCOUNTS_SET_ORACLE_AUTHORITY, [
-      payer.publicKey,
-      slabKp.publicKey,
-    ]);
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX5: TopUpInsurance — optional, seeds the insurance fund
+  // ──────────────────────────────────────────────────────────────────────────
+  let sig5: string | null = null;
+  if (cfg.insuranceAmount > 0n) {
+    console.log(
+      `TX5: TopUpInsurance (${Number(cfg.insuranceAmount) / 1_000_000} USDC)...`,
+    );
 
-    const setAuthTx = new Transaction();
-    addPriorityFee(setAuthTx);
-    setAuthTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }));
-    setAuthTx.add(buildIx({ programId: PROGRAM_ID, keys: setAuthKeys, data: setAuthData }));
-    await sendAndConfirmTransaction(connection, setAuthTx, [payer], { commitment: "confirmed" });
-    console.log("  Oracle authority set");
+    const tx5 = new Transaction();
+    tx5.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
+    tx5.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+    tx5.add(
+      new TransactionInstruction({
+        programId: cfg.programId,
+        keys: buildAccountMetas(ACCOUNTS_TOPUP_INSURANCE, {
+          user: admin.publicKey,
+          slab: slab.publicKey,
+          userAta: adminAta,
+          vault: vaultAta,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          clock: SYSVAR_CLOCK_PUBKEY,
+        }),
+        data: Buffer.from(
+          encodeTopUpInsurance({ amount: cfg.insuranceAmount }),
+        ),
+      }),
+    );
 
-    // Push initial price + crank
-    const now = Math.floor(Date.now() / 1000);
-    const pushData = encodePushOraclePrice({
-      priceE6: INITIAL_PRICE_E6.toString(),
-      timestamp: now.toString(),
-    });
-    const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
-      payer.publicKey,
-      slabKp.publicKey,
-    ]);
-
-    const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-    const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-      payer.publicKey,
-      slabKp.publicKey,
-      SYSVAR_CLOCK_PUBKEY,
-      slabKp.publicKey, // admin oracle: oracle account = slab
-    ]);
-
-    const pushCrankTx = new Transaction();
-    addPriorityFee(pushCrankTx);
-    pushCrankTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }));
-    pushCrankTx.add(buildIx({ programId: PROGRAM_ID, keys: pushKeys, data: pushData }));
-    pushCrankTx.add(buildIx({ programId: PROGRAM_ID, keys: crankKeys, data: crankData }));
-    await sendAndConfirmTransaction(connection, pushCrankTx, [payer], {
-      commitment: "confirmed",
-      skipPreflight: false,
-    });
-    console.log(`  Initial price pushed: ${INITIAL_PRICE_E6} (e6)`);
-  } else {
-    console.log("\nStep 3: Initial crank with Pyth oracle...");
-
-    // Derive the Pyth Push Oracle PDA from the feed ID
-    const [pythPDA] = derivePythPushOraclePDA(ORACLE_FEED);
-    console.log(`  Pyth Push Oracle PDA: ${pythPDA.toBase58()}`);
-
-    // Verify the Pyth account exists on-chain
-    const pythInfo = await connection.getAccountInfo(pythPDA);
-    if (!pythInfo) {
-      console.warn("  WARNING: Pyth Push Oracle account not found on-chain.");
-      console.warn("  The crank will fail until this feed is active. Skipping initial crank.");
-    } else {
-      console.log(`  Pyth account found (${pythInfo.data.length} bytes, owner: ${pythInfo.owner.toBase58().slice(0, 12)}...)`);
-
-      // Crank with Pyth oracle - the program reads the price directly
-      const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
-      const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
-        payer.publicKey,
-        slabKp.publicKey,
-        SYSVAR_CLOCK_PUBKEY,
-        pythPDA, // Pyth Push Oracle PriceUpdateV2 account
-      ]);
-
-      const crankTx = new Transaction();
-      addPriorityFee(crankTx);
-      crankTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }));
-      crankTx.add(buildIx({ programId: PROGRAM_ID, keys: crankKeys, data: crankData }));
-      await sendAndConfirmTransaction(connection, crankTx, [payer], {
-        commitment: "confirmed",
-        skipPreflight: false,
-      });
-      console.log("  Initial crank with Pyth oracle succeeded");
+    try {
+      sig5 = await sendTx(conn, tx5, [admin], "TX5");
+    } catch (e) {
+      // Non-fatal: market is fully functional without insurance seed
+      console.warn(
+        "TX5 WARNING (TopUpInsurance):",
+        e instanceof Error ? e.message : e,
+      );
+      console.warn(
+        "Market is live but has no insurance fund seed. Run top-up separately.",
+      );
     }
   }
 
-  // ========================================================================
-  // Save market info
-  // ========================================================================
-  const mintShort = MINT.toBase58().slice(0, 8);
-  const outPath = `${mintShort}-market.json`;
+  // ──────────────────────────────────────────────────────────────────────────
+  // TX6: InitStakePool — create an insurance LP staking pool for this market
+  //   Creates LP mint + vault token account + InitPool instruction on stake program.
+  //   Allows users to stake collateral and earn insurance LP rewards.
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log("TX6: InitStakePool (create insurance LP staking pool)...");
 
-  const pythPDA = IS_ADMIN_ORACLE ? null : derivePythPushOraclePDA(ORACLE_FEED)[0].toBase58();
+  const STAKE_COOLDOWN_SLOTS = 300n;  // ~2 min cooldown before withdrawal
+  const STAKE_DEPOSIT_CAP = 0n;       // 0 = uncapped
 
-  const marketInfo = {
-    network: "mainnet",
+  const stakeLpMint = Keypair.generate();
+  const stakeVault = Keypair.generate();
+
+  saveKeypairBackup("stake-lp-mint", stakeLpMint, backupDir);
+  saveKeypairBackup("stake-vault", stakeVault, backupDir);
+
+  const [stakePool] = PublicKey.findProgramAddressSync(
+    [Buffer.from("stake_pool"), slab.publicKey.toBuffer()],
+    STAKE_PROG_ID,
+  );
+  const [stakeVaultAuth] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_auth"), stakePool.toBuffer()],
+    STAKE_PROG_ID,
+  );
+
+  console.log(`  Stake pool PDA:   ${stakePool.toBase58()}`);
+  console.log(`  Stake LP mint:    ${stakeLpMint.publicKey.toBase58()}`);
+  console.log(`  Stake vault:      ${stakeVault.publicKey.toBase58()}`);
+  console.log(`  Stake vault auth: ${stakeVaultAuth.toBase58()}`);
+
+  const stakeMintRent = await conn.getMinimumBalanceForRentExemption(MINT_SIZE);
+  const stakeTokenRent = await conn.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_SIZE);
+
+  const tx6 = new Transaction();
+  tx6.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+  tx6.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+
+  // Create LP mint account
+  tx6.add(
+    SystemProgram.createAccount({
+      fromPubkey: admin.publicKey,
+      newAccountPubkey: stakeLpMint.publicKey,
+      lamports: stakeMintRent,
+      space: MINT_SIZE,
+      programId: TOKEN_PROGRAM_ID,
+    }),
+  );
+  // Create vault token account
+  tx6.add(
+    SystemProgram.createAccount({
+      fromPubkey: admin.publicKey,
+      newAccountPubkey: stakeVault.publicKey,
+      lamports: stakeTokenRent,
+      space: TOKEN_ACCOUNT_SIZE,
+      programId: TOKEN_PROGRAM_ID,
+    }),
+  );
+  // InitPool instruction (tag=0, cooldown_slots, deposit_cap)
+  const initPoolData = Buffer.concat([
+    Buffer.from([0]), // tag = InitPool
+    (() => { const b = Buffer.alloc(8); b.writeBigUInt64LE(STAKE_COOLDOWN_SLOTS); return b; })(),
+    (() => { const b = Buffer.alloc(8); b.writeBigUInt64LE(STAKE_DEPOSIT_CAP); return b; })(),
+  ]);
+  tx6.add(
+    new TransactionInstruction({
+      programId: STAKE_PROG_ID,
+      keys: [
+        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
+        { pubkey: slab.publicKey, isSigner: false, isWritable: false },
+        { pubkey: stakePool, isSigner: false, isWritable: true },
+        { pubkey: stakeLpMint.publicKey, isSigner: false, isWritable: true },
+        { pubkey: stakeVault.publicKey, isSigner: false, isWritable: true },
+        { pubkey: stakeVaultAuth, isSigner: false, isWritable: false },
+        { pubkey: cfg.collateralMint, isSigner: false, isWritable: false },
+        { pubkey: cfg.programId, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      data: initPoolData,
+    }),
+  );
+
+  let sig6: string | null = null;
+  try {
+    sig6 = await sendTx(conn, tx6, [admin, stakeLpMint, stakeVault], "TX6");
+  } catch (e) {
+    console.warn("TX6 WARNING (InitStakePool):", e instanceof Error ? e.message : e);
+    console.warn("Market is live but has no stake pool. Run create-stake-pool.ts separately.");
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Save market config to file
+  // ──────────────────────────────────────────────────────────────────────────
+  const marketJson = {
+    programId: cfg.programId.toBase58(),
+    slabAddress: slab.publicKey.toBase58(),
+    matcherCtxAddress: matcherCtx.publicKey.toBase58(),
+    lpPda: lpPda.toBase58(),
+    vaultAta: vaultAta.toBase58(),
+    collateralMint: cfg.collateralMint.toBase58(),
+    dexPool: cfg.dexPoolAddress.toBase58(),
+    stakePool: stakePool.toBase58(),
+    stakeLpMint: stakeLpMint.publicKey.toBase58(),
+    stakeVault: stakeVault.publicKey.toBase58(),
+    stakeVaultAuth: stakeVaultAuth.toBase58(),
+    stakeProgramId: STAKE_PROG_ID.toBase58(),
+    network: cfg.network,
     createdAt: new Date().toISOString(),
-    programId: PROGRAM_ID.toBase58(),
-    slab: slabKp.publicKey.toBase58(),
-    mint: MINT.toBase58(),
-    vault: vault.toBase58(),
-    vaultPda: vaultPda.toBase58(),
-    oracleMode: IS_ADMIN_ORACLE ? "admin" : "pyth",
-    oracleFeed: ORACLE_FEED,
-    pythOraclePDA: pythPDA,
-    inverted: INVERT === 1,
-    initialPriceE6: INITIAL_PRICE_E6.toString(),
-    tradingFeeBps: TRADING_FEE_BPS.toString(),
-    initialMarginBps: INITIAL_MARGIN_BPS.toString(),
-    lpCollateral: LP_COLLATERAL.toString(),
-    insuranceAmount: INSURANCE_AMOUNT.toString(),
-    admin: payer.publicKey.toBase58(),
+    transactions: { sig1, sig2, sig3, sig4, sig5, sig6 },
   };
 
-  fs.writeFileSync(outPath, JSON.stringify(marketInfo, null, 2));
-  console.log(`\nMarket info saved to ${outPath}`);
+  const outFile = path.join(backupDir, "market.json");
+  fs.writeFileSync(outFile, JSON.stringify(marketJson, null, 2));
+  console.log(`\nMarket config saved to: ${outFile}`);
 
-  console.log("\n" + "=".repeat(70));
-  console.log("MARKET CREATED SUCCESSFULLY");
-  console.log("=".repeat(70));
-  console.log(`\n  Slab: ${slabKp.publicKey.toBase58()}`);
-  console.log(`  Mint: ${MINT.toBase58()}`);
-  console.log(`  Oracle: ${IS_ADMIN_ORACLE ? "Admin" : "Pyth"}`);
-  console.log(`  Output: ${outPath}\n`);
+  // ──────────────────────────────────────────────────────────────────────────
+  // NOTE: You must manually insert this market into Supabase for the
+  // frontend and indexer to display it properly. Example SQL:
+  //
+  //   INSERT INTO markets (slab_address, symbol, name, collateral_mint,
+  //     dex_pool_address, oracle_mode, program_id, network)
+  //   VALUES ('<slab>', 'SOL-PERP', 'SOL/USDC Perpetual', '<mint>',
+  //     '<dex_pool>', 'hyperp', '<program_id>', '<network>');
+  //
+  // Without this row, the market appears nameless and is not the default
+  // trading pair on the frontend.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Summary
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log("\n========== MARKET CREATED SUCCESSFULLY ==========");
+  console.log(`Network:         ${cfg.network}`);
+  console.log(`Slab:            ${slab.publicKey.toBase58()}`);
+  console.log(`Matcher ctx:     ${matcherCtx.publicKey.toBase58()}`);
+  console.log(`LP PDA (idx=0):  ${lpPda.toBase58()}`);
+  console.log(`Vault ATA:       ${vaultAta.toBase58()}`);
+  console.log();
+  console.log("Transactions:");
+  console.log(`  TX1 InitMarket:    ${sig1}`);
+  console.log(`  TX2 SetDexPool:    ${sig2}`);
+  console.log(`  TX3 InitLP:        ${sig3}`);
+  console.log(`  TX4 InitMatcherCtx: ${sig4}`);
+  if (sig5) console.log(`  TX5 TopUpInsurance: ${sig5}`);
+  if (sig6) console.log(`  TX6 InitStakePool: ${sig6}`);
+  console.log();
+  console.log(`Config saved to: ${outFile}`);
+  console.log();
+  console.log("NEXT STEPS:");
+  console.log("  1. Insert market row into Supabase (see SQL above in script)");
+  console.log("  2. Restart keeper + indexer to discover the new market");
+  console.log("  3. Wait for first crank (~30s) before attempting trades");
+  console.log("  4. Verify stake pool on frontend at /stake");
+  console.log();
+  console.log("Addresses:");
+  console.log(
+    JSON.stringify(
+      {
+        programId: cfg.programId.toBase58(),
+        slabAddress: slab.publicKey.toBase58(),
+        matcherCtxAddress: matcherCtx.publicKey.toBase58(),
+            lpPda: lpPda.toBase58(),
+        vaultAta: vaultAta.toBase58(),
+        collateralMint: cfg.collateralMint.toBase58(),
+        dexPool: cfg.dexPoolAddress.toBase58(),
+        stakePool: stakePool.toBase58(),
+        stakeLpMint: stakeLpMint.publicKey.toBase58(),
+        stakeVault: stakeVault.publicKey.toBase58(),
+        stakeProgramId: STAKE_PROG_ID.toBase58(),
+        network: cfg.network,
+      },
+      null,
+      2,
+    ),
+  );
+  console.log("=================================================");
 }
 
-main().catch(console.error);
+main().catch((e) => {
+  console.error("Fatal error:", e instanceof Error ? e.message : e);
+  process.exit(1);
+});

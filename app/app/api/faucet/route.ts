@@ -235,7 +235,7 @@ export async function POST(req: NextRequest) {
       // At this point sig is guaranteed non-null (all null paths return early above)
       // GH#1595: claim already recorded by gate INSERT — also log to auto_fund_log for analytics
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (supabase as any).from("auto_fund_log").insert({
+      await supabase.from("auto_fund_log").insert({
         wallet: walletAddress,
         sol_airdropped: true,
         usdc_minted: false,
@@ -391,7 +391,7 @@ export async function POST(req: NextRequest) {
     // Analytics only — do not release gate on failure after on-chain success
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (supabase as any).from("auto_fund_log").insert({
+      await supabase.from("auto_fund_log").insert({
         wallet: walletAddress,
         sol_airdropped: false,
         usdc_minted: true,

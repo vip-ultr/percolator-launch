@@ -18,7 +18,7 @@ import {
   getAta,
   parseAllAccounts,
   AccountKind,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { sendTx } from "@/lib/tx";
 import { useSlabState } from "@/components/providers/SlabProvider";
 
@@ -116,8 +116,10 @@ export function useDeposit(slabAddress: string) {
                 );
               }
 
-              // InitUser (tag 1) — must pay at least newAccountFee (PERC-1126)
-              const accountFee = slabParams?.newAccountFee ?? 0n;
+              // InitUser (tag 1) — must pay max(newAccountFee, minInitialDeposit)
+              const naf = slabParams?.newAccountFee ?? 0n;
+              const mid = slabParams?.minInitialDeposit ?? 0n;
+              const accountFee = naf > mid ? naf : mid;
               instructions.push(
                 buildIx({
                   programId,
@@ -127,6 +129,7 @@ export function useDeposit(slabAddress: string) {
                     userAta,
                     mktConfig.vaultPubkey,
                     WELL_KNOWN.tokenProgram,
+                    WELL_KNOWN.clock,
                   ]),
                   data: encodeInitUser({ feePayment: accountFee.toString() }),
                 }),

@@ -36,8 +36,8 @@ vi.mock("@/lib/config", () => ({
 const mockVaultAuth = new PublicKey("DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1");
 const mockOraclePda = new PublicKey("8DjWTsU1o8RHTKpRsqGFyYqFMknb8g7z2mjLfVYUyYyF");
 
-vi.mock("@percolator/sdk", async () => {
-  const actual = await vi.importActual("@percolator/sdk");
+vi.mock("@percolatorct/sdk", async () => {
+  const actual = await vi.importActual("@percolatorct/sdk");
   return {
     ...actual,
     getAta: vi.fn(),
@@ -49,7 +49,7 @@ vi.mock("@percolator/sdk", async () => {
 import { useConnectionCompat, useWalletCompat } from "@/hooks/useWalletCompat";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { sendTx } from "@/lib/tx";
-import { getAta } from "@percolator/sdk";
+import { getAta } from "@percolatorct/sdk";
 
 describe("useWithdraw", () => {
   const mockSlabAddress = "11111111111111111111111111111111";
@@ -89,20 +89,18 @@ describe("useWithdraw", () => {
         collateralMint: mockCollateralMint,
         vaultPubkey: mockVault,
         oracleAuthority: PublicKey.default,
-        indexFeedId: {
-          toBytes: () => new Array(32).fill(1),
-        },
+        indexFeedId: new PublicKey(new Uint8Array(32).fill(1)),
         authorityPriceE6: 1000000n,
       },
       programId: mockProgramId,
       refresh: vi.fn(),
     };
 
-    ( useConnectionCompat as any).mockReturnValue({ connection: mockConnection });
-    ( useWalletCompat as any).mockReturnValue(mockWallet);
-    (useSlabState as any).mockReturnValue(mockSlabState);
-    (sendTx as any).mockResolvedValue({ signature: "mock-signature" });
-    (getAta as any).mockResolvedValue(mockUserAta);
+    vi.mocked(useConnectionCompat).mockReturnValue({ connection: mockConnection });
+    vi.mocked(useWalletCompat).mockReturnValue(mockWallet);
+    vi.mocked(useSlabState).mockReturnValue(mockSlabState);
+    vi.mocked(sendTx).mockResolvedValue({ signature: "mock-signature" });
+    vi.mocked(getAta).mockResolvedValue(mockUserAta);
 
     // Mock fetch for backend price
     global.fetch = vi.fn().mockResolvedValue({
@@ -139,24 +137,25 @@ describe("useWithdraw", () => {
         });
       });
 
-      const txCall = (sendTx as any).mock.calls[0][0];
+      const txCall = vi.mocked(sendTx).mock.calls[0][0];
       expect(txCall.instructions.length).toBeGreaterThanOrEqual(2); // crank + withdraw
     });
 
-    it("should include oracle price push for admin oracle markets", async () => {
+    it("rejects explicit inline oracle pushes for admin oracle markets until server-side migration lands", async () => {
       mockSlabState.config.oracleAuthority = mockWalletPubkey;
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
       await act(async () => {
-        await result.current.withdraw({
-          userIdx: 1,
-          amount: 1000000n,
-        });
+        await expect(
+          result.current.withdraw({
+            userIdx: 1,
+            amount: 1000000n,
+          })
+        ).rejects.toThrow(/server-side oracle publisher/i);
       });
 
-      const txCall = (sendTx as any).mock.calls[0][0];
-      expect(txCall.instructions).toHaveLength(3); // push price + crank + withdraw
+      expect(sendTx).not.toHaveBeenCalled();
     });
   });
 
@@ -308,23 +307,25 @@ describe("useWithdraw", () => {
   });
 
   describe("Oracle Mode Detection", () => {
-    it("should detect admin oracle when authority is set", async () => {
+    it("rejects inline oracle pushes when the connected wallet is the admin-oracle publisher", async () => {
       mockSlabState.config.oracleAuthority = mockWalletPubkey;
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
       await act(async () => {
-        await result.current.withdraw({
-          userIdx: 1,
-          amount: 1000000n,
-        });
+        await expect(
+          result.current.withdraw({
+            userIdx: 1,
+            amount: 1000000n,
+          })
+        ).rejects.toThrow(/server-side oracle publisher/i);
       });
 
-      expect(sendTx).toHaveBeenCalled();
+      expect(sendTx).not.toHaveBeenCalled();
     });
 
     it("should detect admin oracle when feed is all zeros", async () => {
-      mockSlabState.config.indexFeedId.toBytes = () => new Array(32).fill(0);
+      mockSlabState.config.indexFeedId = PublicKey.default;
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -338,28 +339,8 @@ describe("useWithdraw", () => {
       expect(sendTx).toHaveBeenCalled();
     });
 
-    it("should fetch price from backend for admin oracle", async () => {
+    it("does not attempt the removed inline oracle publisher flow", async () => {
       mockSlabState.config.oracleAuthority = mockWalletPubkey;
-
-      const { result } = renderHook(() => useWithdraw(mockSlabAddress));
-
-      await act(async () => {
-        await result.current.withdraw({
-          userIdx: 1,
-          amount: 1000000n,
-        });
-      });
-
-      expect(global.fetch).toHaveBeenCalledWith(
-        expect.stringContaining("/prices/markets")
-      );
-    });
-
-    it("should abort withdrawal if backend fetch fails (PERC-8328: no hardcoded fallback)", async () => {
-      // PERC-8328 / GH#1966: When price fetch fails, we must NOT fall back to a hardcoded
-      // price (e.g. $1). The withdrawal must abort to prevent catastrophic oracle mispricing.
-      mockSlabState.config.oracleAuthority = mockWalletPubkey;
-      (global.fetch as any).mockRejectedValue(new Error("Network error"));
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -369,21 +350,14 @@ describe("useWithdraw", () => {
             userIdx: 1,
             amount: 1000000n,
           })
-        ).rejects.toThrow("Cannot push oracle price");
+        ).rejects.toThrow(/server-side oracle publisher/i);
       });
 
-      // sendTx must NOT have been called — tx was aborted before reaching the network
-      expect(sendTx).not.toHaveBeenCalled();
-      expect(result.current.error).toContain("Cannot push oracle price");
+      expect(global.fetch).not.toHaveBeenCalled();
     });
 
-    it("should abort withdrawal if backend returns no price for this market (PERC-8328)", async () => {
-      // Backend returned 200 but the specific market has no price entry — must abort.
+    it("surfaces a migration error instead of trying backend price fallback", async () => {
       mockSlabState.config.oracleAuthority = mockWalletPubkey;
-      (global.fetch as any).mockResolvedValue({
-        ok: true,
-        json: async () => ({}), // Empty — no entry for this slab
-      });
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -393,38 +367,18 @@ describe("useWithdraw", () => {
             userIdx: 1,
             amount: 1000000n,
           })
-        ).rejects.toThrow("Cannot push oracle price");
+        ).rejects.toThrow(/server-side oracle publisher/i);
       });
 
       expect(sendTx).not.toHaveBeenCalled();
+      expect(result.current.error).toMatch(/server-side oracle publisher/i);
     });
 
-    it("should abort withdrawal if price is zero or negative (PERC-8328)", async () => {
-      // Even if backend returns a price, reject zero/negative values.
-      mockSlabState.config.oracleAuthority = mockWalletPubkey;
-      (global.fetch as any).mockResolvedValue({
-        ok: true,
-        json: async () => ({ [mockSlabAddress]: { priceE6: "0" } }),
-      });
-
-      const { result } = renderHook(() => useWithdraw(mockSlabAddress));
-
-      await act(async () => {
-        await expect(
-          result.current.withdraw({
-            userIdx: 1,
-            amount: 1000000n,
-          })
-        ).rejects.toThrow("Invalid oracle price");
-      });
-
-      expect(sendTx).not.toHaveBeenCalled();
-    });
   });
 
   describe("Error Handling", () => {
     it("should throw error if wallet not connected", async () => {
-      ( useWalletCompat as any).mockReturnValue({ publicKey: null, connected: false });
+      vi.mocked(useWalletCompat).mockReturnValue({ publicKey: null, connected: false });
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -441,7 +395,7 @@ describe("useWithdraw", () => {
     });
 
     it("should throw error if market config not loaded", async () => {
-      (useSlabState as any).mockReturnValue({ config: null, programId: null, refresh: vi.fn() });
+      vi.mocked(useSlabState).mockReturnValue({ config: null, programId: null, refresh: vi.fn() });
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -456,7 +410,7 @@ describe("useWithdraw", () => {
     });
 
     it("should set error state on transaction failure", async () => {
-      (sendTx as any).mockRejectedValue(new Error("Insufficient balance"));
+      vi.mocked(sendTx).mockRejectedValue(new Error("Insufficient balance"));
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -473,7 +427,7 @@ describe("useWithdraw", () => {
     });
 
     it("should clear error state on new withdrawal attempt", async () => {
-      (sendTx as any).mockRejectedValueOnce(new Error("First error"));
+      vi.mocked(sendTx).mockRejectedValueOnce(new Error("First error"));
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 
@@ -488,7 +442,7 @@ describe("useWithdraw", () => {
       expect(result.current.error).toBe("First error");
 
       // Second withdrawal should clear error
-      (sendTx as any).mockResolvedValue({ signature: "success" });
+      vi.mocked(sendTx).mockResolvedValue({ signature: "success" });
 
       await act(async () => {
         await result.current.withdraw({
@@ -512,7 +466,7 @@ describe("useWithdraw", () => {
         });
       });
 
-      const txCall = (sendTx as any).mock.calls[0][0];
+      const txCall = vi.mocked(sendTx).mock.calls[0][0];
       expect(txCall.computeUnits).toBe(300_000);
     });
   });
@@ -520,7 +474,7 @@ describe("useWithdraw", () => {
   describe("Loading State", () => {
     it("should set loading state during withdrawal", async () => {
       let resolveSendTx: any;
-      (sendTx as any).mockReturnValue(
+      vi.mocked(sendTx).mockReturnValue(
         new Promise((resolve) => {
           resolveSendTx = resolve;
         })
@@ -546,7 +500,7 @@ describe("useWithdraw", () => {
     });
 
     it("should clear loading state on error", async () => {
-      (sendTx as any).mockRejectedValue(new Error("Failed"));
+      vi.mocked(sendTx).mockRejectedValue(new Error("Failed"));
 
       const { result } = renderHook(() => useWithdraw(mockSlabAddress));
 

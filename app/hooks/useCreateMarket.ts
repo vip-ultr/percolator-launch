@@ -19,12 +19,9 @@ import {
   encodeInitLP,
   encodeDepositCollateral,
   encodeTopUpInsurance,
-  encodeCreateInsuranceMint,
   deriveInsuranceLpMint,
   ACCOUNTS_CREATE_INSURANCE_MINT,
   encodeKeeperCrank,
-  encodeSetOracleAuthority,
-  encodePushOraclePrice,
   encodeSetOraclePriceCap,
   encodeUpdateConfig,
   encodeUpdateHyperpMark,
@@ -35,24 +32,32 @@ import {
   ACCOUNTS_DEPOSIT_COLLATERAL,
   ACCOUNTS_TOPUP_INSURANCE,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_SET_ORACLE_AUTHORITY,
   ACCOUNTS_SET_ORACLE_PRICE_CAP,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   ACCOUNTS_UPDATE_CONFIG,
   buildAccountMetas,
   WELL_KNOWN,
   buildIx,
   deriveVaultAuthority,
   derivePythPushOraclePDA,
-} from "@percolator/sdk";
+  parseHeader,
+  SLAB_TIERS,
+  slabDataSize,
+  deriveLpPda,
+} from "@percolatorct/sdk";
+// TODO(oracle-migration): encodeSetOracleAuthority/encodePushOraclePrice and their
+// account lists were removed in beta.29. CreateMarket oracle init/push path needs
+// migration to /api/oracle/advance-phase or equivalent server-side crank flow.
+import {
+  encodeSetOracleAuthority,
+  encodePushOraclePrice,
+  ACCOUNTS_SET_ORACLE_AUTHORITY,
+  ACCOUNTS_PUSH_ORACLE_PRICE,
+} from "@/lib/sdk-compat";
 import { sendTx } from "@/lib/tx";
 import { getConfig, getNetwork } from "@/lib/config";
 import { parseMarketCreationError } from "@/lib/parseMarketError";
-
-import { SLAB_TIERS, slabDataSize, deriveLpPda } from "@percolator/sdk";
 const DEFAULT_SLAB_SIZE = SLAB_TIERS.large.dataSize;
 const ALL_ZEROS_FEED = "0".repeat(64);
-const MATCHER_CTX_SIZE = 320; // Minimum context size for percolator matcher
 
 /**
  * PERC-465: Fetch the current USD price for a token from Jupiter price API.
@@ -322,12 +327,15 @@ export function useCreateMarket() {
             existingAccount = null; // treat as fresh creation
           }
           if (existingAccount) {
-            // Slab already created — check if market is initialized
-            // Use DataView for browser-safe u64 read (Buffer.readBigUInt64LE is Node.js-only)
-            const headerMagic = existingAccount.data.length >= 8
-              ? new DataView(existingAccount.data.buffer, existingAccount.data.byteOffset, existingAccount.data.byteLength).getBigUint64(0, /* littleEndian= */ true)
-              : 0n;
-            const isInitialized = headerMagic === 0x504552434f4c4154n; // "PERCOLAT"
+            // Slab already created — check if market is initialized via SDK parseHeader.
+            // parseHeader throws when magic bytes are absent/wrong (uninitialised slab).
+            let isInitialized: boolean;
+            try {
+              parseHeader(existingAccount.data);
+              isInitialized = true;
+            } catch {
+              isInitialized = false;
+            }
 
             if (isInitialized) {
               // Market already initialized — skip to step 1
@@ -402,13 +410,14 @@ export function useCreateMarket() {
                 tradingFeeBps: BigInt(params.tradingFeeBps).toString(),
                 maxAccounts: (params.maxAccounts ?? 4096).toString(),
                 newAccountFee: "1000000",
-                riskReductionThreshold: "0",
                 maintenanceFeePerSlot: "0",
                 maxCrankStalenessSlots: "400",
                 liquidationFeeBps: "100",
                 liquidationFeeCap: "100000000000",
-                liquidationBufferBps: "50",
                 minLiquidationAbs: "1000000",
+                minInitialDeposit: "1000000",
+                minNonzeroMmReq: "0",
+                minNonzeroImReq: "0",
               });
 
               const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
@@ -547,13 +556,14 @@ export function useCreateMarket() {
               tradingFeeBps: BigInt(params.tradingFeeBps).toString(),
               maxAccounts: (params.maxAccounts ?? 4096).toString(),
               newAccountFee: "1000000",
-              riskReductionThreshold: "0",
               maintenanceFeePerSlot: "0",
               maxCrankStalenessSlots: "400",
               liquidationFeeBps: "100",
               liquidationFeeCap: "100000000000",
-              liquidationBufferBps: "50",
               minLiquidationAbs: "1000000",
+              minInitialDeposit: "1000000",
+              minNonzeroMmReq: "0",
+              minNonzeroImReq: "0",
             });
 
             const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
@@ -628,20 +638,12 @@ export function useCreateMarket() {
           }
 
           // UpdateConfig — set funding rate parameters (MidTermDev Step 6)
+          // v12.17: UpdateConfig only accepts 4 funding params (threshold/insurance set at InitMarket)
           const updateConfigData = encodeUpdateConfig({
             fundingHorizonSlots: "3600",
             fundingKBps: "100",
-            fundingInvScaleNotionalE6: "1000000000000",
             fundingMaxPremiumBps: "1000",
             fundingMaxBpsPerSlot: "10",
-            threshFloor: "0",
-            threshRiskBps: "500",
-            threshUpdateIntervalSlots: "100",
-            threshStepBps: "100",
-            threshAlphaBps: "5000",
-            threshMin: "0",
-            threshMax: "1000000000000000000",
-            threshMinStep: "0",
           });
           const updateConfigKeys = buildAccountMetas(ACCOUNTS_UPDATE_CONFIG, [
             wallet.publicKey, slabPk,
@@ -667,7 +669,7 @@ export function useCreateMarket() {
             instructions.push(new TransactionInstruction({ programId, keys: hyperpKeys, data: Buffer.from(hyperpData) }));
           } else {
             // KeeperCrank for Pyth and admin modes
-            const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
+            const crankData = encodeKeeperCrank({ callerIdx: 65535 });
             const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
             const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
               wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
@@ -702,7 +704,7 @@ export function useCreateMarket() {
           } else {
 
           const matcherCtxKp = Keypair.generate();
-          const matcherCtxRent = await connection.getMinimumBalanceForRentExemption(MATCHER_CTX_SIZE);
+          const matcherCtxRent = await connection.getMinimumBalanceForRentExemption(cfg.matcherCtxSize);
 
           const [lpPda] = deriveLpPda(programId, slabPk, lpIdx);
 
@@ -714,7 +716,7 @@ export function useCreateMarket() {
                 fromPubkey: wallet.publicKey,
                 newAccountPubkey: matcherCtxKp.publicKey,
                 lamports: matcherCtxRent,
-                space: MATCHER_CTX_SIZE,
+                space: cfg.matcherCtxSize,
                 programId: matcherProgramId,
               });
 
@@ -729,8 +731,9 @@ export function useCreateMarket() {
             matcherContext: matcherCtxKp.publicKey,
             feePayment: "1000000",
           });
+          // beta.32: ACCOUNTS_INIT_LP expanded to 6 accounts — added clock
           const initLpKeys = buildAccountMetas(ACCOUNTS_INIT_LP, [
-            wallet.publicKey, slabPk, userAta, vaultAta, WELL_KNOWN.tokenProgram,
+            wallet.publicKey, slabPk, userAta, vaultAta, WELL_KNOWN.tokenProgram, WELL_KNOWN.clock,
           ]);
           const initLpIx = buildIx({ programId, keys: initLpKeys, data: initLpData });
 
@@ -850,7 +853,7 @@ export function useCreateMarket() {
             finalInstructions.push(new TransactionInstruction({ programId, keys: hyperpKeys, data: Buffer.from(hyperpData) }));
           } else {
             const oracleAccount = isAdminOracle ? slabPk : derivePythPushOraclePDA(params.oracleFeed)[0];
-            const crankData = encodeKeeperCrank({ callerIdx: 65535, allowPanic: false });
+            const crankData = encodeKeeperCrank({ callerIdx: 65535 });
             const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
               wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount,
             ]);
@@ -922,53 +925,8 @@ export function useCreateMarket() {
           }
         }
 
-        // Step 4: Create Insurance LP Mint (permissionless insurance deposits)
-        // GH#1761: This step is non-fatal. The market is already live and tradeable
-        // after steps 1-4. A tx expiry here (devnet congestion) should NOT block success.
-        // We catch the error, set insuranceMintFailed=true, and proceed to the success screen.
-        // The user can retry step 5 independently; the success screen shows a soft warning.
-        if (startStep <= 4) {
-          setState((s) => ({ ...s, step: 4, stepLabel: STEP_LABELS[4] }));
-
-          const [insLpMint] = deriveInsuranceLpMint(programId, slabPk);
-          const [vaultAuth] = deriveVaultAuthority(programId, slabPk);
-
-          const createMintData = encodeCreateInsuranceMint();
-          const createMintKeys = buildAccountMetas(ACCOUNTS_CREATE_INSURANCE_MINT, [
-            wallet.publicKey,          // admin (signer)
-            slabPk,                    // slab
-            insLpMint,                 // ins_lp_mint (writable, PDA)
-            vaultAuth,                 // vault_authority
-            params.mint,               // collateral_mint
-            SystemProgram.programId,   // system_program
-            WELL_KNOWN.tokenProgram,   // token_program
-            WELL_KNOWN.rent,           // rent
-            wallet.publicKey,          // payer (signer, writable)
-          ]);
-          const createMintIx = buildIx({ programId, keys: createMintKeys, data: createMintData });
-
-          try {
-            const sig = await sendTx({
-              connection, wallet,
-              instructions: [createMintIx],
-              computeUnits: 200_000,
-              // GH#1761: Use maxRetries=3 for step 5 to handle devnet congestion.
-              // The default is 2; an extra retry gives more tolerance for tx expiry.
-              maxRetries: 3,
-            });
-            setState((s) => ({ ...s, txSigs: [...s.txSigs, sig] }));
-          } catch (step5Err) {
-            // GH#1761: Step 5 failure is non-fatal. Market is live from steps 1-4.
-            // Log the error, set the flag, and let flow continue to success screen.
-            console.warn("[useCreateMarket] GH#1761: Insurance LP Mint (step 5) failed:", step5Err);
-            setState((s) => ({
-              ...s,
-              insuranceMintFailed: true,
-              // Mark step as done visually so the progress bar advances past it
-              txSigs: [...s.txSigs, "skipped-insurance-mint-failed"],
-            }));
-          }
-        }
+        // Insurance LP mint creation removed — moved to percolator-stake program.
+        // Markets are fully operational without it (steps 0-3 are sufficient).
 
         // PERC-465: Post-creation hooks — register with oracle keeper + mint devnet token
         const slabAddr = slabPk.toBase58();

@@ -141,7 +141,8 @@ export const AutoDepositProvider: FC<AutoDepositProviderProps> = ({
   slabAddress,
   children,
 }) => {
-  const isDevnet = process.env.NEXT_PUBLIC_SOLANA_NETWORK === "devnet";
+  const isDevnet =
+    (process.env.NEXT_PUBLIC_DEFAULT_NETWORK ?? process.env.NEXT_PUBLIC_SOLANA_NETWORK) === "devnet";
   const state = useAutoDeposit(slabAddress);
 
   if (!isDevnet) {

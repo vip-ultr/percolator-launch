@@ -174,7 +174,7 @@ export function TradeHistory() {
             <p className="mt-1 text-[10px] text-[var(--text-dim)]/60">
               Your executed trades will appear here once the trade indexer has processed them.
             </p>
-            {process.env.NEXT_PUBLIC_SOLANA_NETWORK === "devnet" && (
+            {(process.env.NEXT_PUBLIC_DEFAULT_NETWORK ?? process.env.NEXT_PUBLIC_SOLANA_NETWORK) === "devnet" && (
               <p className="mt-2 text-[10px] text-[var(--warning)]/60">
                 ⚠ Devnet: trade indexer may not be running. Trades are on-chain but not yet indexed.
               </p>

@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PublicKey } from "@solana/web3.js";
-import { SLAB_TIERS, type SlabTierKey } from "@percolator/sdk";
+import { SLAB_TIERS, type SlabTierKey } from "@percolatorct/sdk";
 import { getRpcEndpoint } from "@/lib/config";
 import { getClientIp } from "@/lib/get-client-ip";
 import {
   checkLaunchRateLimit,
   CREATE_MARKET_RATE_LIMIT,
 } from "@/lib/create-market-rate-limit";
+import { validateTokenMetadata, validateDexScreenerResponse } from "@/lib/token-metadata-validators";
 import * as Sentry from "@sentry/nextjs";
 
 export const dynamic = 'force-dynamic';
@@ -46,7 +47,7 @@ interface LaunchConfig {
  * needed to create a market. The frontend executes the transactions
  * since we need the user's wallet to sign.
  *
- * Input: { mint: string, slabTier: "micro"|"small"|"medium"|"large" }
+ * Input: { mint: string, slabTier: "small"|"medium"|"large" }
  * Response: LaunchConfig | { error: string }
  */
 export async function POST(req: NextRequest) {
@@ -171,30 +172,39 @@ export async function POST(req: NextRequest) {
       // Use defaults if metadata not found
     }
 
-    // 2. Auto-detect DEX pool via DexScreener
+    // 2. Auto-detect DEX pool via DexScreener (with timeout and validation)
     let bestPool: DexPoolDetection | null = null;
     try {
       const dexResp = await fetch(
         `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-        { headers: { "User-Agent": "percolator-launch/1.0" } },
+        {
+          headers: { "User-Agent": "percolator-launch/1.0" },
+          signal: AbortSignal.timeout(8000), // EXTERNAL-API-001: Add timeout
+        },
       );
       const dexData = await dexResp.json();
-      const pairs = dexData.pairs || [];
+      const pairs = (Array.isArray(dexData.pairs) ? dexData.pairs : []) as unknown[];
 
       const candidates: DexPoolDetection[] = [];
-      for (const pair of pairs) {
+      for (const rawPair of pairs) {
+        if (!rawPair || typeof rawPair !== 'object') continue;
+        const pair = rawPair as Record<string, unknown>;
+
         if (pair.chainId !== "solana") continue;
-        const dexId = (pair.dexId || "").toLowerCase();
+        const dexId = (pair.dexId ?? "").toString().toLowerCase();
         if (!SUPPORTED_DEX_IDS.has(dexId)) continue;
-        const liquidity = pair.liquidity?.usd || 0;
-        if (liquidity < 100) continue;
+        const liquidity = (pair.liquidity as Record<string, unknown> | undefined)?.usd as number | undefined;
+        if (!liquidity || liquidity < 100) continue;
+
+        const baseToken = pair.baseToken as Record<string, unknown> | undefined;
+        const quoteToken = pair.quoteToken as Record<string, unknown> | undefined;
 
         candidates.push({
-          poolAddress: pair.pairAddress,
+          poolAddress: String(pair.pairAddress ?? ""),
           dexId,
-          pairLabel: `${pair.baseToken?.symbol || "?"} / ${pair.quoteToken?.symbol || "?"}`,
+          pairLabel: `${baseToken?.symbol ?? "?"} / ${quoteToken?.symbol ?? "?"}`,
           liquidityUsd: liquidity,
-          priceUsd: parseFloat(pair.priceUsd) || 0,
+          priceUsd: parseFloat(String(pair.priceUsd ?? "0")) || 0,
         });
       }
 

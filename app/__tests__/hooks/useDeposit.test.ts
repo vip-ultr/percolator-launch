@@ -28,8 +28,8 @@ vi.mock("@/lib/tx", () => ({
   sendTx: vi.fn(),
 }));
 
-vi.mock("@percolator/sdk", async () => {
-  const actual = await vi.importActual("@percolator/sdk");
+vi.mock("@percolatorct/sdk", async () => {
+  const actual = await vi.importActual("@percolatorct/sdk");
   return {
     ...actual,
     getAta: vi.fn(),
@@ -39,7 +39,7 @@ vi.mock("@percolator/sdk", async () => {
 import { useConnectionCompat, useWalletCompat } from "@/hooks/useWalletCompat";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { sendTx } from "@/lib/tx";
-import { getAta } from "@percolator/sdk";
+import { getAta } from "@percolatorct/sdk";
 
 describe("useDeposit", () => {
   const mockSlabAddress = "11111111111111111111111111111111";
@@ -87,11 +87,11 @@ describe("useDeposit", () => {
       refresh: vi.fn(),
     };
 
-    ( useConnectionCompat as any).mockReturnValue({ connection: mockConnection });
-    ( useWalletCompat as any).mockReturnValue(mockWallet);
-    (useSlabState as any).mockReturnValue(mockSlabState);
-    (sendTx as any).mockResolvedValue({ signature: "mock-signature" });
-    (getAta as any).mockResolvedValue(mockUserAta);
+    vi.mocked(useConnectionCompat).mockReturnValue({ connection: mockConnection });
+    vi.mocked(useWalletCompat).mockReturnValue(mockWallet);
+    vi.mocked(useSlabState).mockReturnValue(mockSlabState);
+    vi.mocked(sendTx).mockResolvedValue({ signature: "mock-signature" });
+    vi.mocked(getAta).mockResolvedValue(mockUserAta);
   });
 
   describe("Happy Path", () => {
@@ -141,7 +141,7 @@ describe("useDeposit", () => {
         });
       });
 
-      const txCall = (sendTx as any).mock.calls[0][0];
+      const txCall = vi.mocked(sendTx).mock.calls[0][0];
       expect(txCall.instructions).toBeDefined();
       // Amount is encoded in instruction data - we trust it's the passed value
       expect(sendTx).toHaveBeenCalled();
@@ -296,7 +296,7 @@ describe("useDeposit", () => {
 
   describe("Error Handling", () => {
     it("should throw error if wallet not connected", async () => {
-      ( useWalletCompat as any).mockReturnValue({ publicKey: null, connected: false, connecting: false, wallet: null, signTransaction: undefined, disconnect: vi.fn() });
+      vi.mocked(useWalletCompat).mockReturnValue({ publicKey: null, connected: false, connecting: false, wallet: null, signTransaction: undefined, disconnect: vi.fn() });
 
       const { result } = renderHook(() => useDeposit(mockSlabAddress));
 
@@ -313,7 +313,7 @@ describe("useDeposit", () => {
     });
 
     it("should throw error if market config not loaded", async () => {
-      (useSlabState as any).mockReturnValue({ config: null, programId: null, refresh: vi.fn() });
+      vi.mocked(useSlabState).mockReturnValue({ config: null, programId: null, refresh: vi.fn() });
 
       const { result } = renderHook(() => useDeposit(mockSlabAddress));
 
@@ -328,7 +328,7 @@ describe("useDeposit", () => {
     });
 
     it("should set error state on transaction failure", async () => {
-      (sendTx as any).mockRejectedValue(new Error("Transaction failed"));
+      vi.mocked(sendTx).mockRejectedValue(new Error("Transaction failed"));
 
       const { result } = renderHook(() => useDeposit(mockSlabAddress));
 
@@ -345,7 +345,7 @@ describe("useDeposit", () => {
     });
 
     it("should clear error state on new deposit attempt", async () => {
-      (sendTx as any).mockRejectedValueOnce(new Error("First error"));
+      vi.mocked(sendTx).mockRejectedValueOnce(new Error("First error"));
 
       const { result } = renderHook(() => useDeposit(mockSlabAddress));
 
@@ -360,7 +360,7 @@ describe("useDeposit", () => {
       expect(result.current.error).toBe("First error");
 
       // Second deposit should clear error
-      (sendTx as any).mockResolvedValue({ signature: "success" });
+      vi.mocked(sendTx).mockResolvedValue({ signature: "success" });
 
       await act(async () => {
         await result.current.deposit({
@@ -376,7 +376,7 @@ describe("useDeposit", () => {
   describe("Loading State", () => {
     it("should set loading state during deposit", async () => {
       let resolveSendTx: any;
-      (sendTx as any).mockReturnValue(
+      vi.mocked(sendTx).mockReturnValue(
         new Promise((resolve) => {
           resolveSendTx = resolve;
         })
@@ -402,7 +402,7 @@ describe("useDeposit", () => {
     });
 
     it("should clear loading state on error", async () => {
-      (sendTx as any).mockRejectedValue(new Error("Failed"));
+      vi.mocked(sendTx).mockRejectedValue(new Error("Failed"));
 
       const { result } = renderHook(() => useDeposit(mockSlabAddress));
 

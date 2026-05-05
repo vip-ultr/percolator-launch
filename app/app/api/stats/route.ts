@@ -9,6 +9,7 @@ import { isActiveMarket, isSaneMarketValue, isZombieMarket } from "@/lib/activeM
 import { isPhantomOpenInterest } from "@/lib/phantom-oi";
 import { BLOCKED_SLAB_ADDRESSES } from "@/lib/blocklist";
 import { getClientIp } from "@/lib/get-client-ip";
+import { createMemoryRateLimiter } from "@/lib/memory-rate-limit";
 import type { Database } from "@/lib/database.types";
 export const dynamic = "force-dynamic";
 
@@ -16,34 +17,11 @@ type MarketWithStats = Database['public']['Views']['markets_with_stats']['Row'];
 
 // ---------------------------------------------------------------------------
 // PERC-660: In-memory rate limiter — 60 req/min per IP (matches /api/trader pattern)
-// Note: per-process only (multi-instance: effective limit = 60 × N). At mainnet
-// scale, replace with Redis-backed rate limiting. On Vercel (serverless) functions
-// are short-lived so memory growth is bounded.
+// Uses shared createMemoryRateLimiter from lib/memory-rate-limit.ts.
+// Per-process only (multi-instance: effective limit = 60 × N). At mainnet
+// scale, replace with Redis-backed rate limiting.
 // ---------------------------------------------------------------------------
-const RATE_LIMIT = 60;
-const RATE_WINDOW_MS = 60_000;
-const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-/** Prune expired entries to prevent unbounded memory growth on long-running instances. */
-function pruneExpired(): void {
-  const now = Date.now();
-  for (const [ip, entry] of rateMap.entries()) {
-    if (now > entry.resetAt) rateMap.delete(ip);
-  }
-}
-
-function isRateLimited(ip: string): boolean {
-  pruneExpired();
-  const now = Date.now();
-  const entry = rateMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateMap.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    return false;
-  }
-  if (entry.count >= RATE_LIMIT) return true;
-  entry.count++;
-  return false;
-}
+const rateLimiter = createMemoryRateLimiter({ limit: 60, windowMs: 60_000 });
 
 /**
  * GET /api/stats — Platform-wide aggregated statistics
@@ -55,7 +33,7 @@ function isRateLimited(ip: string): boolean {
  */
 export async function GET(request: NextRequest) {
   const ip = getClientIp(request);
-  if (isRateLimited(ip)) {
+  if (rateLimiter.isLimited(ip)) {
     return NextResponse.json(
       { error: "Rate limited. Max 60 requests per minute." },
       { status: 429, headers: { "Retry-After": "60" } },
@@ -107,15 +85,14 @@ export async function GET(request: NextRequest) {
         .limit(500);
 
       if (fallback.error && fallback.error.message?.includes("network")) {
-        // Tier 3: network column also missing — fully unfiltered
-        console.warn(
-          "[/api/stats] PERC-8215: network column also missing — falling back to fully unfiltered query."
+        // Tier 3: network column also missing — fully unfiltered.
+        // WARNING: Without network column, we cannot distinguish devnet from mainnet.
+        // Return empty stats with a degraded flag rather than silently mixing networks.
+        console.error(
+          "[/api/stats] CRITICAL: both indexer_excluded and network columns missing — " +
+          "cannot serve accurate stats. Apply migrations 20260329180000 and 20260402170000."
         );
-        const STATS_SELECT_NO_NET = STATS_SELECT.replace(", network", "");
-        const fallback2 = await supabase.from("markets_with_stats")
-          .select(STATS_SELECT_NO_NET)
-          .limit(500);
-        statsData_raw = fallback2.data as typeof statsData_raw;
+        statsData_raw = [] as typeof statsData_raw;
       } else {
         statsData_raw = fallback.data as typeof statsData_raw;
       }
@@ -249,20 +226,25 @@ export async function GET(request: NextRequest) {
     return usd > MAX_PER_MARKET_USD ? 0 : usd;
   };
 
-  // GH#1419: Only include volume_24h from markets whose stats were updated within 48h.
-  // A market with stats_updated_at > 48h ago has stale rolling stats — its volume_24h
-  // no longer reflects actual 24h activity and will inflate the platform total.
-  // 48h is intentionally generous: the StatsCollector runs every few minutes, so a
-  // >48h gap means the market's indexer stopped (vault drained, market closed, etc).
+  // GH#1419: Prefer fresh volume_24h (updated within 48h) but fall back to all
+  // active markets if every single one is stale. This prevents the stats endpoint
+  // from returning 0 for totalVolume24h when the StatsCollector hasn't run recently
+  // (GH#2083). When at least one market has fresh data, stale markets are excluded
+  // to avoid inflating totals. When ALL data is stale, showing the best-available
+  // (slightly outdated) numbers is better than showing zeros.
   const STALE_VOLUME_THRESHOLD_MS = 48 * 60 * 60 * 1000; // 48 hours
   const now = Date.now();
+  const isStaleMarket = (m: Record<string, unknown>): boolean => {
+    const updatedAt = m.stats_updated_at as string | null;
+    if (!updatedAt) return false; // no timestamp → treat as fresh (backward compat)
+    return (now - new Date(updatedAt).getTime()) > STALE_VOLUME_THRESHOLD_MS;
+  };
+  const hasFreshData = activeData.some((m) => !isStaleMarket(m as Record<string, unknown>));
   const totalVolume24h = activeData.reduce(
     (sum, m) => {
-      const updatedAt = (m as Record<string, unknown>).stats_updated_at as string | null;
-      if (updatedAt) {
-        const ageMs = now - new Date(updatedAt).getTime();
-        if (ageMs > STALE_VOLUME_THRESHOLD_MS) return sum; // skip stale volume
-      }
+      // GH#2083: Only skip stale markets if at least one market has fresh data.
+      // If ALL markets are stale, include them all to avoid returning 0.
+      if (hasFreshData && isStaleMarket(m as Record<string, unknown>)) return sum;
       return sum + toUsd(m.volume_24h ?? 0, m);
     },
     0
@@ -313,12 +295,9 @@ export async function GET(request: NextRequest) {
   // or supabase HEAD count limitation. Use trade_count_24h from markets_with_stats instead,
   // which is the same source used by /api/markets and is reliable.
   // GH#1419: Also skip stale markets (>48h) for trade_count_24h to match volume filter.
+  // GH#2083: Same hasFreshData fallback as volume — show stale trade counts rather than 0.
   const trades24h = activeData.reduce((sum, m) => {
-    const updatedAt = (m as Record<string, unknown>).stats_updated_at as string | null;
-    if (updatedAt) {
-      const ageMs = now - new Date(updatedAt).getTime();
-      if (ageMs > STALE_VOLUME_THRESHOLD_MS) return sum; // skip stale trade count
-    }
+    if (hasFreshData && isStaleMarket(m as Record<string, unknown>)) return sum;
     return sum + (m.trade_count_24h ?? 0);
   }, 0);
 

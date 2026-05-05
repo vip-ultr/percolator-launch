@@ -82,7 +82,8 @@ export function useAutoDeposit(slabAddress: string): AutoDepositState {
   // Prevent concurrent attempts (in-memory ref is fine — concurrency is within one page load)
   const inflightRef = useRef(false);
 
-  const isDevnet = process.env.NEXT_PUBLIC_SOLANA_NETWORK === "devnet";
+  const isDevnet =
+    (process.env.NEXT_PUBLIC_DEFAULT_NETWORK ?? process.env.NEXT_PUBLIC_SOLANA_NETWORK) === "devnet";
 
   const attemptAutoDeposit = useCallback(async () => {
     if (!publicKey || !mktConfig?.collateralMint || !isDevnet) return;

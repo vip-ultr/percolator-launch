@@ -76,7 +76,8 @@ const HELIUS_DEVNET_RPC = HELIUS_API_KEY
 export function useDevnetFaucet(): DevnetFaucetState {
   const { publicKey, connected } = useWalletCompat();
   const { connection } = useConnectionCompat();
-  const isDevnet = process.env.NEXT_PUBLIC_SOLANA_NETWORK === "devnet";
+  const isDevnet =
+    (process.env.NEXT_PUBLIC_DEFAULT_NETWORK ?? process.env.NEXT_PUBLIC_SOLANA_NETWORK) === "devnet";
 
   // PERC-808: Use global config testUsdcMint instead of SlabProvider — works on all pages
   const usdcMintPk = (() => {

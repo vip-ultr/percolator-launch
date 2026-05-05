@@ -29,8 +29,7 @@ function CreatePageInner() {
       new PublicKey(mintParam);
       initialMint = mintParam;
     } catch (err) {
-      console.warn("Invalid mint parameter in URL:", mintParam);
-      // initialMint stays undefined
+      // Invalid base58 — ignore and use default
     }
   }
 

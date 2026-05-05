@@ -107,7 +107,10 @@ export function formatUsd(priceE6: bigint | null | undefined): string {
  * "-" when zero/null, otherwise delegates to formatUsd.
  */
 export function formatLiqPrice(liqPriceE6: bigint | null | undefined): string {
-  if (liqPriceE6 == null || liqPriceE6 <= 0n) return "N/A";
+  if (liqPriceE6 == null) return "N/A";
+  // 0n = no liq price (no position open, or position not yet priced). Show "N/A".
+  if (liqPriceE6 <= 0n) return "N/A";
+  // Sentinel = max u64: position is so overcollateralized it cannot be liquidated.
   if (liqPriceE6 >= LIQ_PRICE_UNLIQUIDATABLE) return "∞";
   return formatUsd(liqPriceE6);
 }

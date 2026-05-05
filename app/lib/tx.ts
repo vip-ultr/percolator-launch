@@ -1,4 +1,5 @@
 import { Connection, Transaction, TransactionInstruction, ComputeBudgetProgram, SendTransactionError } from "@solana/web3.js";
+import bs58 from "bs58";
 import type { PublicKey, Signer } from "@solana/web3.js";
 import { getConfig } from "./config";
 
@@ -8,12 +9,19 @@ import { getConfig } from "./config";
  * fail on-chain for programs Blowfish doesn't understand, causing tx reverts even
  * though the actual program logic is correct.
  */
-const LIGHTHOUSE_PROGRAM_ID = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+export const LIGHTHOUSE_PROGRAM_ID = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
 
 /** Wallet shape compatible with both old wallet-adapter and Privy compat layer */
 export interface WalletLike {
   publicKey: PublicKey | null;
   signTransaction?: (tx: Transaction) => Promise<Transaction>;
+  /**
+   * PERC-8388: Atomic sign+send bypasses Lighthouse/Blowfish injection.
+   * The wallet signs and sends in one step, so there is no post-sign window
+   * for middleware to inject assertion instructions that break our tx.
+   * Returns the raw transaction signature bytes.
+   */
+  signAndSendTransaction?: (tx: Transaction) => Promise<Uint8Array>;
 }
 
 export interface SendTxParams {
@@ -47,7 +55,6 @@ const PRIORITY_FEE_FALLBACK = Number(process.env.NEXT_PUBLIC_PRIORITY_FEE ?? 100
  */
 async function getPriorityFee(connection: Connection): Promise<number> {
   try {
-    // @ts-ignore - getRecentPrioritizationFees not in @solana/web3.js types yet
     const fees = await connection.getRecentPrioritizationFees();
     
     if (!fees || fees.length === 0) {
@@ -55,7 +62,7 @@ async function getPriorityFee(connection: Connection): Promise<number> {
     }
     
     // Use 75th percentile of recent fees for better reliability
-    const sorted = fees.map((f: any) => f.prioritizationFee).sort((a: number, b: number) => a - b);
+    const sorted = fees.map((f) => f.prioritizationFee).sort((a, b) => a - b);
     const p75Index = Math.floor(sorted.length * 0.75);
     const dynamicFee = sorted[p75Index] || 0;
     
@@ -347,7 +354,7 @@ export async function sendTx({
   abortSignal,
   skipPreflight = false,
 }: SendTxParams): Promise<string> {
-  if (!wallet.publicKey || !wallet.signTransaction) {
+  if (!wallet.publicKey || (!wallet.signTransaction && !wallet.signAndSendTransaction)) {
     throw new Error("Wallet not connected");
   }
   
@@ -396,16 +403,14 @@ export async function sendTx({
       tx.recentBlockhash = blockhash;
       tx.feePayer = wallet.publicKey;
 
-      if (signers.length > 0) {
-        tx.partialSign(...signers);
-      }
-
       // Pre-sign simulation: catch program errors before the user signs.
       // This gives a clear error message instead of a cryptic post-sign failure.
       // Skipped when skipPreflight is true (PERC-8388: wallet middleware injects
       // assertion IXs that fail simulation but aren't in our actual tx).
-      if (!skipPreflight) try {
-        const simResult = await connection.simulateTransaction(tx, signers.length > 0 ? signers : undefined);
+      // Skip pre-sign simulation when extra signers are present — the wallet
+      // hasn't signed yet so simulation will fail with MissingRequiredSignature.
+      if (!skipPreflight && signers.length === 0) try {
+        const simResult = await connection.simulateTransaction(tx);
         if (simResult.value.err) {
           const logs = simResult.value.logs ?? [];
           // Extract the most useful log line (program error or custom message)
@@ -428,99 +433,99 @@ export async function sendTx({
         console.warn("[sendTx] Pre-sign simulation failed (non-blocking):", simError);
       }
 
-      // Save expected instruction count before signing so we can detect
-      // post-sign Lighthouse injection by the wallet.
-      const expectedIxCount = tx.instructions.length;
+      // ================================================================
+      // PERC-8388: Use signAndSendTransaction when available.
+      // This is the definitive fix for Lighthouse/Blowfish injection.
+      // The wallet signs and broadcasts atomically — there is no post-sign
+      // window for middleware to inject assertion instructions.
+      // ================================================================
+      if (wallet.signAndSendTransaction && signers.length === 0) {
+        // Only use atomic sign+send when there are no extra signers.
+        // signAndSendTransaction may drop partial signatures from keypair signers.
+        try {
+          const sigBytes = await wallet.signAndSendTransaction(tx);
+          // Privy returns raw signature bytes (64 bytes). Convert to base58.
+          lastSignature = bs58.encode(sigBytes);
+        } catch (sendErr) {
+          const sendMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+          // Check for Lighthouse-specific errors and provide user-friendly message
+          if (
+            sendMsg.includes(LIGHTHOUSE_PROGRAM_ID) ||
+            sendMsg.includes("0x1900") ||
+            sendMsg.includes("Lighthouse")
+          ) {
+            throw new Error(
+              "Transaction blocked by wallet security (Blowfish/Lighthouse). " +
+              "Your wallet's transaction guard flagged this as unknown. " +
+              "Try disabling transaction simulation in your wallet settings, " +
+              "or use a different wallet. This is a known issue for new DeFi programs."
+            );
+          }
+          throw sendErr;
+        }
+      } else if (wallet.signTransaction) {
+        // Fallback: signTransaction + sendRawTransaction (legacy path)
+        const signed = await wallet.signTransaction(tx);
 
-      const signed = await wallet.signTransaction(tx);
-
-      // PERC-8388: Detect if the wallet injected Lighthouse assertion instructions
-      // during signTransaction. If so, rebuild the transaction without them and
-      // re-sign. Lighthouse assertions execute on-chain and fail for programs that
-      // Blowfish doesn't understand, causing correct transactions to revert.
-      const lighthouseIxs = signed.instructions.filter(
-        (ix) => ix.programId.toBase58() === LIGHTHOUSE_PROGRAM_ID
-      );
-      if (lighthouseIxs.length > 0) {
-        console.warn(
-          `[sendTx] PERC-8388: Wallet injected ${lighthouseIxs.length} Lighthouse assertion instruction(s). ` +
-          `Rebuilding transaction without them to prevent on-chain assertion failures.`
-        );
-        // Strip Lighthouse instructions and re-sign
-        const cleanTx = new Transaction();
-        cleanTx.recentBlockhash = signed.recentBlockhash;
-        cleanTx.feePayer = signed.feePayer;
-        for (const ix of signed.instructions) {
-          if (ix.programId.toBase58() !== LIGHTHOUSE_PROGRAM_ID) {
-            cleanTx.add(ix);
+        // Add keypair signatures AFTER wallet signs — Privy embedded wallets
+        // may strip unknown signatures during their signing flow.
+        if (signers.length > 0) {
+          for (const signer of signers) {
+            signed.partialSign(signer);
           }
         }
-        if (signers.length > 0) {
-          cleanTx.partialSign(...signers);
-        }
-        // Re-sign the clean transaction — the wallet may re-inject Lighthouse,
-        // but we attempt once. If re-injection happens again, we detect it and
-        // log but proceed (some wallets only inject on first sign).
-        const reSigned = await wallet.signTransaction(cleanTx);
-        const stillHasLighthouse = reSigned.instructions.some(
+
+        // PERC-8388: Detect Lighthouse injection and warn
+        const lighthouseIxs = signed.instructions.filter(
           (ix) => ix.programId.toBase58() === LIGHTHOUSE_PROGRAM_ID
         );
-        if (stillHasLighthouse) {
+        if (lighthouseIxs.length > 0) {
           console.warn(
-            "[sendTx] PERC-8388: Wallet re-injected Lighthouse on second sign. " +
-            "Sending with skipPreflight=true as last resort."
+            `[sendTx] PERC-8388: Wallet injected ${lighthouseIxs.length} Lighthouse IX(s). ` +
+            `Sending with skipPreflight=true as workaround.`
           );
-          // Force skipPreflight and hope the assertions pass on-chain this time,
-          // or that the user disables Blowfish in their wallet settings.
           skipPreflight = true;
         }
-        // Use the re-signed (or still-injected) transaction
-        Object.assign(signed, reSigned);
-      }
 
-      // Preflight defaults to enabled — skipPreflight is generally unsafe because
-      // it bypasses node-level validation before broadcast. However, it can be
-      // passed as true as a fallback when wallet middleware (Blowfish/Lighthouse)
-      // injects assertion instructions that fail during simulation (PERC-8388).
-      try {
-        lastSignature = await connection.sendRawTransaction(signed.serialize(), {
-          skipPreflight: skipPreflight ?? false,
-          maxRetries: 5,
-        });
-      } catch (sendErr) {
-        const sendMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
-        const isBatchError =
-          sendMsg.includes("Missing response from batch") ||
-          sendMsg.includes("failed to get recent blockhash") ||
-          sendMsg.includes("RPC response error");
+        try {
+          lastSignature = await connection.sendRawTransaction(signed.serialize(), {
+            skipPreflight: skipPreflight ?? false,
+            maxRetries: 5,
+          });
+        } catch (sendErr) {
+          const sendMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+          const isBatchError =
+            sendMsg.includes("Missing response from batch") ||
+            sendMsg.includes("failed to get recent blockhash") ||
+            sendMsg.includes("RPC response error");
 
-        if (isBatchError) {
-          // RPC is unhealthy — log and let the outer retry loop handle it.
-          // We no longer fall back to skipPreflight:true on this path (GH#1942).
-          console.warn(
-            `[sendTx] Batch RPC error (attempt ${attempt + 1}); will retry.`
-          );
-          throw sendErr;
-        } else if (sendErr instanceof SendTransactionError) {
-          // Extract logs for non-batch SendTransactionErrors to give a clearer message
-          try {
-            const logs = await sendErr.getLogs(connection);
-            if (logs && logs.length > 0) {
-              const relevantLogs = logs
-                .filter((l: string) =>
-                  l.includes("Error") || l.includes("failed") || l.includes("Program log:")
-                )
-                .slice(-5)
-                .join("\n");
-              throw new Error(`${sendMsg}${relevantLogs ? `\n${relevantLogs}` : ""}`);
+          if (isBatchError) {
+            console.warn(
+              `[sendTx] Batch RPC error (attempt ${attempt + 1}); will retry.`
+            );
+            throw sendErr;
+          } else if (sendErr instanceof SendTransactionError) {
+            try {
+              const logs = await sendErr.getLogs(connection);
+              if (logs && logs.length > 0) {
+                const relevantLogs = logs
+                  .filter((l: string) =>
+                    l.includes("Error") || l.includes("failed") || l.includes("Program log:")
+                  )
+                  .slice(-5)
+                  .join("\n");
+                throw new Error(`${sendMsg}${relevantLogs ? `\n${relevantLogs}` : ""}`);
+              }
+            } catch (logsErr) {
+              if (logsErr instanceof Error && logsErr.message !== sendMsg) throw logsErr;
             }
-          } catch (logsErr) {
-            if (logsErr instanceof Error && logsErr.message !== sendMsg) throw logsErr;
+            throw sendErr;
+          } else {
+            throw sendErr;
           }
-          throw sendErr;
-        } else {
-          throw sendErr;
         }
+      } else {
+        throw new Error("Wallet not connected — no sign method available");
       }
 
       // Poll for confirmation instead of using confirmTransaction
@@ -565,6 +570,26 @@ export async function sendTx({
             // RPC error checking status — proceed with retry
           }
         }
+
+        // SAFETY: If the wallet used signAndSendTransaction (atomic sign+broadcast),
+        // do NOT rebuild and re-send — the first tx may still land on-chain, and
+        // re-sending would execute the operation twice (double trade, double fee).
+        // Instead, only extend polling for the existing signature.
+        if (wallet.signAndSendTransaction && lastSignature) {
+          // Give the original tx more time to land before giving up
+          await new Promise((r) => setTimeout(r, 4000));
+          try {
+            const retryStatus = await connection.getSignatureStatuses([lastSignature], {
+              searchTransactionHistory: true,
+            });
+            const s = retryStatus.value[0];
+            if (s && !s.err && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
+              return lastSignature;
+            }
+          } catch { /* fall through to throw */ }
+          throw lastError;
+        }
+
         await new Promise((r) => setTimeout(r, 2000));
         continue;
       }

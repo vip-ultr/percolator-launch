@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient, getServerNetwork } from "@/lib/supabase";
 import { PublicKey } from "@solana/web3.js";
 import { getClientIp } from "@/lib/get-client-ip";
+import { createMemoryRateLimiter } from "@/lib/memory-rate-limit";
 
 /**
  * GET /api/trader/:wallet/stats
@@ -27,37 +28,10 @@ export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
 // Rate limiter — 30 req/min per IP (stats endpoint is heavier than paginated list)
+// Uses shared createMemoryRateLimiter from lib/memory-rate-limit.ts.
 // ---------------------------------------------------------------------------
 const RATE_LIMIT = 30;
-const RATE_WINDOW_MS = 60_000;
-
-// Exported for testing only — do not import outside of test files.
-export const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-// Evict expired entries when the map grows large to prevent unbounded memory growth.
-// Threshold of 500 is conservative — a typical Railway instance won't see more than a few
-// hundred unique IPs in a 60s window under normal load.
-const EVICTION_THRESHOLD = 500;
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-
-  // Sweep expired entries before inserting a new one.
-  if (rateMap.size > EVICTION_THRESHOLD) {
-    for (const [k, v] of rateMap) {
-      if (now > v.resetAt) rateMap.delete(k);
-    }
-  }
-
-  const entry = rateMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateMap.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    return false;
-  }
-  if (entry.count >= RATE_LIMIT) return true;
-  entry.count++;
-  return false;
-}
+const rateLimiter = createMemoryRateLimiter({ limit: RATE_LIMIT, windowMs: 60_000 });
 
 export interface TraderStatsResponse {
   totalTrades: number;
@@ -81,7 +55,7 @@ export async function GET(
 ) {
   // Rate limiting
   const ip = getClientIp(request);
-  if (isRateLimited(ip)) {
+  if (rateLimiter.isLimited(ip)) {
     return NextResponse.json(
       { error: "Too many requests — max 30 per minute" },
       {

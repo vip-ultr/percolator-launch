@@ -74,7 +74,10 @@ const nextConfig: NextConfig = {
       { source: "/api/insurance/:slab", destination: `${API_URL}/insurance/:slab` },
       // GH#1462: Moved to app/api/open-interest/[slab]/route.ts for defense-in-depth phantom OI filtering.
       // { source: "/api/open-interest/:slab", destination: `${API_URL}/open-interest/:slab` },
-      { source: "/api/prices/:path*", destination: `${API_URL}/prices/:path*` },
+      // NOTE: Do NOT rewrite /api/prices/:slab — app/api/prices/[slab]/route.ts
+      // transforms backend { prices } into { stats: { change24h, high24h, low24h } }
+      // that MarketInfoBar + useLivePrice consume. A rewrite here silently bypasses
+      // that transform, leaving 24H HIGH / 24H LOW as dashes in the UI.
       { source: "/api/crank/status", destination: `${API_URL}/crank/status` },
       { source: "/api/trades/recent", destination: `${API_URL}/trades/recent` },
       // PERC-470: /api/oracle/resolve is handled by Next.js route.ts (returns oracleMode + dexPoolAddress).
@@ -94,6 +97,16 @@ const nextConfig: NextConfig = {
         path: false,
         os: false,
       };
+      // Next.js aliases browser `require('buffer')` to its own compiled
+      // polyfill at node_modules/next/dist/compiled/buffer/index.js,
+      // which is missing Node 12+ BigInt methods (writeBigUInt64LE etc.).
+      // That breaks spl-token's createExecuteInstruction on the transfer-
+      // hook path. We DON'T try to override that alias here anymore —
+      // earlier attempts (plain resolve.alias, NormalModuleReplacement-
+      // Plugin) proved ineffective against Next's internal fallback.
+      // Instead, app/hooks/useTransferPositionNft.ts builds the Execute
+      // ix by hand via DataView, avoiding Buffer.writeBigUInt64LE
+      // altogether. No bundler hack required.
     }
     return config;
   },

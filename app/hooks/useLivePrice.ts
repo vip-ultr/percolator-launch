@@ -144,15 +144,17 @@ export function useLivePrice(): PriceState {
     const rawE6 = BigInt(Math.round(dbPrice * 1_000_000));
     dbRawE6Ref.current = rawE6;
     setState((prev) => {
-      // Allow overwrite only when no live price has been received yet.
-      if (prev.price !== null) {
-        // If we already have a price but invert changed, recompute from stored rawE6.
-        // This handles the race where DB price lands before mktConfig.
-        return prev;
-      }
-      // Apply invert flag: for inverted markets the effective price is 1e12 / rawE6
+      // Recompute from stored rawE6 when:
+      // 1. No live price has been received yet (initial DB fallback), OR
+      // 2. The invert flag changed after the initial paint (race: DB price
+      //    arrived before mktConfig). Without this, inverted markets show
+      //    the raw (non-inverted) price until a WebSocket update arrives.
       const e6 = applyInvert(rawE6, mktConfig?.invert);
       const usd = e6 > 0n ? Number(e6) / 1_000_000 : dbPrice;
+      if (prev.price !== null && prev.priceE6 === e6) {
+        // Price already correct — no update needed
+        return prev;
+      }
       return { ...prev, price: usd, priceUsd: usd, priceE6: e6, loading: false };
     });
   }, [marketJson, mktConfig?.invert]);

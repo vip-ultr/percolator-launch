@@ -53,13 +53,6 @@ export const AutoFundProvider: FC<{ children?: ReactNode }> = ({ children }) => 
     // Fund just completed — expose result and start expiry timer
     setWindowedResult(rawResult);
 
-    const parts: string[] = [];
-    if (rawResult.sol_airdropped) parts.push(`${rawResult.sol_amount} SOL`);
-    if (rawResult.usdc_minted) parts.push(`${rawResult.usdc_amount} USDC`);
-    if (parts.length > 0) {
-      console.log(`[AutoFund] ✅ Funded: ${parts.join(" + ")}`);
-    }
-
     // After the window, clear the result so late-mounting useAutoDeposit instances
     // (e.g. navigating to a second trade page) do NOT trigger the Privy modal.
     timerRef.current = setTimeout(() => {

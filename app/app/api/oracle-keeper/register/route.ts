@@ -77,10 +77,10 @@ export async function POST(req: NextRequest) {
     }
 
     // Step 1: Write mainnet_ca to Supabase so oracle service can look up the token price
-    let dbResult: { slab_address: string; mainnet_ca: string; symbol?: string } | null = null;
+    let dbResult: { slab_address: string; mainnet_ca: string | null; symbol?: string } | null = null;
     try {
       const supabase = getServiceClient();
-      const { data, error } = await (supabase as any)
+      const { data, error } = await supabase
         .from("markets")
         .update({
           mainnet_ca: mainnetCA,

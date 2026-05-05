@@ -3,20 +3,62 @@
 import { useEffect, useState } from "react";
 import { PublicKey } from "@solana/web3.js";
 import { useConnectionCompat } from "@/hooks/useWalletCompat";
-import { discoverMarkets, type DiscoveredMarket } from "@percolator/sdk";
-import { getConfig } from "@/lib/config";
+import {
+  discoverMarketsViaStaticBundle,
+  type DiscoveredMarket,
+} from "@percolatorct/sdk";
+import { getAllProgramIds, getNetwork } from "@/lib/config";
 import { isBlockedSlab } from "@/lib/blocklist";
+import { discoverMarketsViaProgramDirectory } from "@/lib/market-directory-discovery";
 
-/** Get all unique program IDs to scan (default + all slab tier programs) */
-function getAllProgramIds(): PublicKey[] {
-  const cfg = getConfig();
-  const ids = new Set<string>();
-  if (cfg.programId) ids.add(cfg.programId);
-  const byTier = (cfg as any).programsBySlabTier as Record<string, string> | undefined;
-  if (byTier) {
-    Object.values(byTier).forEach((id) => { if (id) ids.add(id); });
+const MAINNET_STATIC_MARKETS = [
+  {
+    slabAddress: "AiVcTXxKfKmcpUBG3unxCdEHHtXvAq8zYpbtS6oPrV6J",
+    symbol: "SOL-PERP",
+    name: "SOL/USD Perpetual",
+  },
+];
+
+/** Get all unique program PublicKeys to scan */
+function getProgramPublicKeys(): PublicKey[] {
+  return getAllProgramIds().map((id) => new PublicKey(id));
+}
+
+function getApiBaseUrl(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  return new URL("/api", window.location.origin).toString();
+}
+
+async function discoverForProgram(
+  connection: ReturnType<typeof useConnectionCompat>["connection"],
+  programId: PublicKey,
+): Promise<DiscoveredMarket[]> {
+  const network = getNetwork();
+  const apiBaseUrl = getApiBaseUrl();
+
+  // In-browser getProgramAccounts tier scans are expensive and can trigger
+  // RPC batch drops. Prefer the app API as an address directory, then fetch
+  // the returned slabs with getMultipleAccounts through the normal connection.
+  if (apiBaseUrl) {
+    const viaApi = await discoverMarketsViaProgramDirectory(connection, programId, apiBaseUrl, {
+      timeoutMs: 8_000,
+    }).catch(() => [] as DiscoveredMarket[]);
+    if (viaApi.length > 0) return viaApi;
   }
-  return [...ids].filter(Boolean).map((id) => new PublicKey(id));
+
+  if (network === "mainnet") {
+    const viaStatic = await discoverMarketsViaStaticBundle(
+      connection,
+      programId,
+      MAINNET_STATIC_MARKETS,
+    ).catch(() => [] as DiscoveredMarket[]);
+    if (viaStatic.length > 0) return viaStatic;
+  }
+
+  // Do not run getProgramAccounts tier scans from the browser. They are too
+  // expensive for public RPCs and can trigger repeated batch failures when the
+  // API/static directory is unavailable.
+  return [];
 }
 
 /**
@@ -29,7 +71,7 @@ export function useMarketDiscovery() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const programIds = getAllProgramIds();
+    const programIds = getProgramPublicKeys();
     if (programIds.length === 0) {
       setLoading(false);
       setError("PROGRAM_ID not configured");
@@ -41,7 +83,7 @@ export function useMarketDiscovery() {
     async function load() {
       try {
         const results = await Promise.all(
-          programIds.map((pid) => discoverMarkets(connection, pid).catch(() => [] as DiscoveredMarket[]))
+          programIds.map((pid) => discoverForProgram(connection, pid))
         );
         if (!cancelled) {
           // GH#1115: deduplicate across program-ID scans — same slab can appear from

@@ -9,9 +9,10 @@ import {
   deriveDepositPda,
   STAKE_POOL_SIZE,
   decodeStakePool,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { unpackAccount, getMint } from "@solana/spl-token";
 import { useStakeDepositByPool } from "@/hooks/useStakeDepositByPool";
+import { useStakeDepositJunior } from "@/hooks/useStakeDepositJunior";
 import { useStakeWithdrawByPool } from "@/hooks/useStakeWithdrawByPool";
 import { parseHumanAmount } from "@/lib/parseAmount";
 import { ScrollReveal } from "@/components/ui/ScrollReveal";
@@ -330,14 +331,22 @@ function DepositWidget({
   const [walletBalanceRaw, setWalletBalanceRaw] = useState<bigint | null>(null);
   const [balanceDecimals, setBalanceDecimals] = useState(6);
   const [txStatus, setTxStatus] = useState<{ type: "success" | "error"; msg: string } | null>(null);
+  const [tranche, setTranche] = useState<"senior" | "junior">("senior");
 
   const pool = pools.find((p) => p.id === selectedPool) ?? pools[0];
   const amountNum = parseFloat(amount) || 0;
 
-  const { deposit, loading: depositLoading, error: depositError } = useStakeDepositByPool({
+  const seniorHook = useStakeDepositByPool({
     slabAddress: pool?.slabAddress ?? "",
     collateralMint: pool?.collateralMint ?? "",
   });
+  const juniorHook = useStakeDepositJunior({
+    slabAddress: pool?.slabAddress ?? "",
+    collateralMint: pool?.collateralMint ?? "",
+  });
+
+  const { deposit, loading: depositLoading, error: depositError } =
+    tranche === "senior" ? seniorHook : juniorHook;
 
   // Sync selectedPool when pools list loads
   useEffect(() => {
@@ -404,6 +413,40 @@ function DepositWidget({
         <span className="text-[10px] font-medium uppercase tracking-[0.2em] text-[var(--text-secondary)]">// deposit</span>
       </div>
       <div className="p-4 space-y-4">
+        {/* Tranche selector */}
+        <div>
+          <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-secondary)]">Tranche</label>
+          <div className="flex gap-0 border border-[var(--border)]">
+            <button
+              type="button"
+              onClick={() => { setTranche("senior"); setTxStatus(null); }}
+              className={`flex-1 py-2 text-[11px] font-medium uppercase tracking-[0.1em] transition-colors duration-150 ${
+                tranche === "senior"
+                  ? "bg-[var(--accent)]/[0.12] text-[var(--accent)] border-r border-[var(--border)]"
+                  : "bg-transparent text-[var(--text-muted)] border-r border-[var(--border)] hover:text-[var(--text-secondary)]"
+              }`}
+            >
+              Senior
+            </button>
+            <button
+              type="button"
+              onClick={() => { setTranche("junior"); setTxStatus(null); }}
+              className={`flex-1 py-2 text-[11px] font-medium uppercase tracking-[0.1em] transition-colors duration-150 ${
+                tranche === "junior"
+                  ? "bg-[var(--warning)]/[0.12] text-[var(--warning)]"
+                  : "bg-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+              }`}
+            >
+              Junior
+            </button>
+          </div>
+          {tranche === "junior" && (
+            <p className="mt-1.5 text-[10px] text-[var(--warning)]/80 leading-relaxed">
+              Junior earns higher fees but absorbs losses first.
+            </p>
+          )}
+        </div>
+
         {/* Pool selector */}
         <div>
           <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-[0.15em] text-[var(--text-secondary)]">Select Pool</label>
@@ -753,8 +796,8 @@ export default function StakePage() {
               });
             }
             return; // found a position, stop scanning
-          } catch {
-            // skip pool on error
+          } catch (poolErr) {
+            console.error("[StakePage] Pool position check failed:", pool.slabAddress, poolErr);
           }
         }
         // No position found across all pools

@@ -8,11 +8,9 @@
     "build": "pnpm -r build",
     "dev": "pnpm --filter @percolator/app dev",
     "build:app": "pnpm --filter @percolator/app build",
-    "build:core": "pnpm --filter @percolator/sdk build",
     "pretest": "pnpm --filter @percolator/shared build",
     "test": "pnpm -r test",
     "test:app": "cd app && pnpm test",
-    "test:core": "cd packages/core && pnpm test",
     "test:hooks": "cd app && pnpm vitest run __tests__/hooks/",
     "test:unit": "pnpm -r test:unit",
     "test:e2e": "playwright test",
@@ -28,7 +26,8 @@
     "fleet:keygen": "tsx scripts/generate-keeper-wallets.ts --airdrop",
     "fleet:keygen:dry": "tsx scripts/generate-keeper-wallets.ts",
     "fleet:deploy": "bash scripts/deploy-mm-fleet.sh",
-    "fleet:deploy:dry": "bash scripts/deploy-mm-fleet.sh --dry-run"
+    "fleet:deploy:dry": "bash scripts/deploy-mm-fleet.sh --dry-run",
+    "localnet:test": "npx tsx tests/localnet/test-trade-flow.ts"
   },
   "engines": {
     "node": ">=20"
@@ -38,12 +37,12 @@
     "@typescript-eslint/eslint-plugin": "^6.21.0",
     "@typescript-eslint/parser": "^6.21.0",
     "eslint": "^8.56.0",
-    "msw": "^2.12.10",
     "playwright": "^1.58.2",
     "prettier": "^3.2.5",
     "tsx": "^4.21.0"
   },
   "dependencies": {
+    "@percolatorct/sdk": "^2.0.9",
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
     "dotenv": "^17.3.1"
@@ -59,7 +58,7 @@
     },
     "overrides": {
       "ajv": ">=6.14.0",
-      "axios": ">=1.13.5",
+      "axios": ">=1.15.2",
       "bn.js": ">=5.2.3",
       "lodash": ">=4.18.0",
       "minimatch": ">=10.2.3",
@@ -72,7 +71,8 @@
       "h3": ">=1.15.9",
       "socket.io-parser": ">=4.2.6",
       "flatted": ">=3.4.0",
-      "defu": ">=6.1.5"
+      "defu": ">=6.1.5",
+      "vite": ">=7.3.2"
     }
   }
 }

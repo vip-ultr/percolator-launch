@@ -2,22 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient } from "@/lib/supabase";
 import { requireAdminSession } from "@/lib/admin-session";
 import { getClientIp } from "@/lib/get-client-ip";
+import { createMemoryRateLimiter } from "@/lib/memory-rate-limit";
 
 export const dynamic = 'force-dynamic';
 
-const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateMap.set(ip, { count: 1, resetAt: now + 3600_000 });
-    return false;
-  }
-  if (entry.count >= 3) return true;
-  entry.count++;
-  return false;
-}
+// 3 applications per IP per hour
+const rateLimiter = createMemoryRateLimiter({ limit: 3, windowMs: 3600_000 });
 
 function sanitize(str: string): string {
   return str.replace(/[<>]/g, "").trim();
@@ -35,7 +25,7 @@ export async function GET() {
 
   try {
     const sb = getServiceClient();
-    const { data, error } = await (sb.from as any)("job_applications")
+    const { data, error } = await sb.from("job_applications")
       .select(
         "id, name, twitter_handle, discord, telegram, email, desired_role, experience_level, about, portfolio_links, cv_filename, availability, solana_wallet, status, created_at"
       )
@@ -58,7 +48,7 @@ export async function POST(req: NextRequest) {
   try {
     const ip = getClientIp(req);
 
-    if (isRateLimited(ip)) {
+    if (rateLimiter.isLimited(ip)) {
       return NextResponse.json(
         { error: "Rate limited — max 3 applications per hour" },
         { status: 429 }
@@ -111,7 +101,7 @@ export async function POST(req: NextRequest) {
     }
 
     const sb = getServiceClient();
-    const { error } = await (sb.from as any)(TABLE).insert({
+    const { error } = await sb.from(TABLE).insert({
       name,
       twitter_handle,
       discord,

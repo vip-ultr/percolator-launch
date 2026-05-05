@@ -24,7 +24,7 @@ describe("WarmupProgress Component", () => {
   });
 
   it("should not render when no warmup is active (404 response)", async () => {
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false,
       status: 404,
     });
@@ -39,7 +39,7 @@ describe("WarmupProgress Component", () => {
   });
 
   it("should render loading state initially", () => {
-    (global.fetch as any).mockImplementation(
+    vi.mocked(global.fetch).mockImplementation(
       () => new Promise(() => {}) // Never resolves
     );
 
@@ -61,7 +61,7 @@ describe("WarmupProgress Component", () => {
       lockedAmount: "78190000",
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockWarmupData,
     });
@@ -92,7 +92,7 @@ describe("WarmupProgress Component", () => {
       lockedAmount: "0",
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockWarmupData,
     });
@@ -115,7 +115,7 @@ describe("WarmupProgress Component", () => {
       lockedAmount: "78190000",
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockWarmupData,
     });
@@ -129,7 +129,7 @@ describe("WarmupProgress Component", () => {
   });
 
   it("should handle API errors gracefully", async () => {
-    (global.fetch as any).mockRejectedValueOnce(
+    vi.mocked(global.fetch).mockRejectedValueOnce(
       new Error("Network error")
     );
 
@@ -154,7 +154,7 @@ describe("WarmupProgress Component", () => {
       lockedAmount: "78190000",
     };
 
-    (global.fetch as any).mockResolvedValue({
+    vi.mocked(global.fetch).mockResolvedValue({
       ok: true,
       json: async () => mockWarmupData,
     });
@@ -190,7 +190,7 @@ describe("WarmupProgress Component", () => {
       lockedAmount: "78190000",
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockWarmupData,
     });

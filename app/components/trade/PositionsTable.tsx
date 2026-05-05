@@ -7,7 +7,8 @@ import { useSlabState } from "@/components/providers/SlabProvider";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import { useMarketConfig } from "@/hooks/useMarketConfig";
-import { AccountKind } from "@percolator/sdk";
+import { useMarketInfo } from "@/hooks/useMarketInfo";
+import { AccountKind } from "@percolatorct/sdk";
 import {
   formatTokenAmount,
   formatUsd,
@@ -22,6 +23,9 @@ import { ClosePositionModal } from "./ClosePositionModal";
 import { WarmupProgress } from "./WarmupProgress";
 import { sanitizeSymbol } from "@/lib/symbol-utils";
 import { useOracleFreshness } from "@/hooks/useOracleFreshness";
+import { getEntryPrice, clearEntryPrice } from "@/lib/entry-price";
+import { applyInvert, sanitizePriceE6 } from "@/lib/oraclePrice";
+import { isSentinelValue } from "@/lib/health";
 
 function abs(n: bigint): bigint {
   return n < 0n ? -n : n;
@@ -36,7 +40,10 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
   const { priceE6: livePriceE6, priceUsd } = useLivePrice();
   const tokenMeta = useTokenMeta(mktConfig?.collateralMint ?? null);
   const mintAddress = mktConfig?.collateralMint?.toBase58() ?? "";
-  const symbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
+  const collateralSymbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
+  // Market pair symbol from Supabase (e.g. "SOL") vs collateral token symbol ("USDC")
+  const { market: marketInfo } = useMarketInfo(slabAddress);
+  const symbol = marketInfo?.symbol ?? collateralSymbol;
   const decimals = tokenMeta?.decimals ?? 6;
 
   const { closePosition, loading: closeLoading, error: closeError, phase: closePhase } = useClosePosition(slabAddress);
@@ -94,18 +101,29 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
 
   const isLong = account.positionSize > 0n;
   const absPosition = abs(account.positionSize);
-  const onChainPriceE6 = config?.lastEffectivePriceE6 ?? null;
+  // Apply invert + sanitize so inverted markets don't display the reciprocal
+  // during WS reconnects.
+  const onChainPriceE6 = config
+    ? sanitizePriceE6(applyInvert(config.lastEffectivePriceE6, config.invert))
+    : null;
   const currentPriceE6 = livePriceE6 ?? onChainPriceE6 ?? 0n;
-  const entryPriceE6 = account.entryPrice;
+  const rawEntryPrice = account.entryPrice;
+  // V12_1: entry_price removed from on-chain struct (returns 0). Fall back to
+  // client-side saved entry price (mark at trade time), then current mark.
+  const savedEntryPrice = rawEntryPrice > 0n ? 0n : getEntryPrice(slabAddress, userAccount.idx);
+  const resolvedEntryPrice = rawEntryPrice > 0n ? rawEntryPrice : (savedEntryPrice > 0n ? savedEntryPrice : 0n);
+  const entryPriceE6 = resolvedEntryPrice > 0n ? resolvedEntryPrice : currentPriceE6;
   const maintenanceBps = params?.maintenanceMarginBps ?? 500n;
 
   // PERC-297: Mark price is considered "available" when it's a positive value.
-  // When mark is unavailable (oracle not initialized, price feed stale, or tx
-  // just processed before price arrives), PnL/ROE cannot be computed reliably.
   const hasValidMark = currentPriceE6 > 0n;
 
+  // PnL computation: prefer mark-to-market from entry price (on-chain or saved),
+  // fall back to on-chain realized PnL if neither is available.
   const pnlTokens = hasValidMark
-    ? computeMarkPnl(account.positionSize, entryPriceE6, currentPriceE6)
+    ? (resolvedEntryPrice > 0n
+        ? computeMarkPnl(account.positionSize, resolvedEntryPrice, currentPriceE6)
+        : (isSentinelValue(account.pnl) ? 0n : account.pnl))
     : 0n;
   const pnlUsdRaw = priceUsd !== null && hasValidMark
     ? (Number(pnlTokens) / (10 ** decimals)) * priceUsd
@@ -149,6 +167,7 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
   const handleConfirmClose = async (percent: number) => {
     try {
       await closePosition(percent);
+      if (percent === 100) clearEntryPrice(slabAddress, userAccount.idx);
       setShowCloseModal(false);
     } catch {
       // error shown via hook state
@@ -221,11 +240,11 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
                 {formatLiqPrice(liqPriceE6)}
               </td>
 
-              {/* PnL */}
+              {/* PnL — realised in the collateral token (USDC on a SOL/USDC market), not the underlying. */}
               <td className={`whitespace-nowrap px-3 py-2.5 text-right ${hasValidMark ? pnlColor : "text-[var(--text-dim)]"}`} style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums" }}>
                 {hasValidMark ? (
                   <>
-                    <div>{formatPnl(pnlTokens, decimals)} {symbol}</div>
+                    <div>{formatPnl(pnlTokens, decimals)} {collateralSymbol}</div>
                     {pnlUsd !== null && (
                       <div className="text-[9px]">
                         {pnlUsd >= 0 ? "+" : ""}${Math.abs(pnlUsd).toFixed(2)}
@@ -278,6 +297,7 @@ export const PositionsTable: FC<{ slabAddress: string }> = ({ slabAddress }) => 
           currentPrice={currentPriceE6}
           capital={account.capital}
           symbol={symbol}
+          collateralSymbol={collateralSymbol}
           decimals={decimals}
           priceUsd={priceUsd}
           isLong={isLong}

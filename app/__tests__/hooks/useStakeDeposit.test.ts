@@ -37,16 +37,18 @@ vi.mock('@/lib/tx', () => ({
   sendTx: vi.fn(),
 }));
 
-vi.mock('@percolator/sdk', () => {
+vi.mock('@percolatorct/sdk', () => {
   const { PublicKey: PK } = require('@solana/web3.js');
   const devnetProgramId = new PK('6aJb1F9CDCVWCNYFwj8aQsVb696YnW6J1FznteHq4Q6k');
   return {
     STAKE_PROGRAM_ID: devnetProgramId,
+    STAKE_POOL_SIZE: 352,
     getStakeProgramId: vi.fn().mockReturnValue(devnetProgramId),
     deriveStakePool: vi.fn().mockReturnValue([mockPool, 255]),
     deriveStakeVaultAuth: vi.fn().mockReturnValue([mockVaultAuth, 254]),
     deriveDepositPda: vi.fn().mockReturnValue([mockDepositPda, 253]),
     encodeStakeDeposit: vi.fn().mockReturnValue(Buffer.concat([Buffer.from([1]), Buffer.alloc(8)])),
+    decodeStakePool: vi.fn().mockReturnValue({ lpMint: mockLpMint, vault: mockVault }),
     depositAccounts: vi.fn().mockReturnValue([
       { pubkey: new PK('7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU'), isSigner: true, isWritable: false },
     ]),
@@ -72,11 +74,11 @@ import { useConnectionCompat, useWalletCompat } from '@/hooks/useWalletCompat';
 import { useSlabState } from '@/components/providers/SlabProvider';
 import { useParams } from 'next/navigation';
 import { sendTx } from '@/lib/tx';
-import { encodeStakeDeposit, depositAccounts } from '@percolator/sdk';
+import { encodeStakeDeposit, depositAccounts } from '@percolatorct/sdk';
 
-// Build a fake pool account buffer (186 bytes)
+// Build a fake pool account buffer sized like the real StakePool account.
 function buildPoolAccountData(): Buffer {
-  const buf = Buffer.alloc(186);
+  const buf = Buffer.alloc(352);
   buf[0] = 1; // is_initialized
   mockLpMint.toBuffer().copy(buf, 65);
   mockVault.toBuffer().copy(buf, 97);
@@ -112,14 +114,14 @@ describe('useStakeDeposit', () => {
       disconnect: vi.fn(),
     };
 
-    (useConnectionCompat as any).mockReturnValue({ connection: mockConnection });
-    (useWalletCompat as any).mockReturnValue(mockWallet);
-    (useSlabState as any).mockReturnValue({
+    vi.mocked(useConnectionCompat).mockReturnValue({ connection: mockConnection });
+    vi.mocked(useWalletCompat).mockReturnValue(mockWallet);
+    vi.mocked(useSlabState).mockReturnValue({
       config: { collateralMint: mockCollateralMint, vaultPubkey: mockVault },
       programId: new PublicKey('5BZWY6XWPxuWFxs2nPCLLsVaKRWZVnzZh3FkJDLJBkJf'),
     });
-    (useParams as any).mockReturnValue({ slab: mockSlabAddress });
-    (sendTx as any).mockResolvedValue('fakeSig123');
+    vi.mocked(useParams).mockReturnValue({ slab: mockSlabAddress });
+    vi.mocked(sendTx).mockResolvedValue('fakeSig123');
   });
 
   it('successfully deposits and returns tx signature', async () => {
@@ -139,7 +141,7 @@ describe('useStakeDeposit', () => {
   });
 
   it('rejects when wallet not connected', async () => {
-    (useWalletCompat as any).mockReturnValue({
+    vi.mocked(useWalletCompat).mockReturnValue({
       publicKey: null,
       connected: false,
       signTransaction: undefined,
@@ -155,7 +157,7 @@ describe('useStakeDeposit', () => {
   });
 
   it('rejects when market not loaded', async () => {
-    (useSlabState as any).mockReturnValue({ config: null, programId: null });
+    vi.mocked(useSlabState).mockReturnValue({ config: null, programId: null });
 
     const { result } = renderHook(() => useStakeDeposit());
 
@@ -220,7 +222,7 @@ describe('useStakeDeposit', () => {
 
   it('prevents double-submit', async () => {
     let resolveFirst!: (v: string) => void;
-    (sendTx as any).mockImplementationOnce(
+    vi.mocked(sendTx).mockImplementationOnce(
       () => new Promise<string>((resolve) => { resolveFirst = resolve; }),
     );
 

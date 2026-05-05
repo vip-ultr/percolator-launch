@@ -5,23 +5,61 @@ import { PublicKey } from "@solana/web3.js";
 import { useConnectionCompat } from "@/hooks/useWalletCompat";
 import { useWalletCompat } from "@/hooks/useWalletCompat";
 import {
-  discoverMarkets,
-  fetchSlab,
+  discoverMarketsViaStaticBundle,
   parseAllAccounts,
   parseConfig,
   parseParams,
-  parseEngine,
   AccountKind,
   computeLiqPrice,
   computeMarkPnl,
   computePnlPercent,
   type DiscoveredMarket,
   type Account,
-  type RiskParams,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { isSentinelValue } from "@/lib/health";
-import { getConfig } from "@/lib/config";
+import { getAllProgramIds, getNetwork } from "@/lib/config";
 import { applyInvert, sanitizePriceE6 } from "@/lib/oraclePrice";
+import { getEntryPrice } from "@/lib/entry-price";
+import { discoverMarketsViaProgramDirectory } from "@/lib/market-directory-discovery";
+
+const MAINNET_STATIC_MARKETS = [
+  {
+    slabAddress: "AiVcTXxKfKmcpUBG3unxCdEHHtXvAq8zYpbtS6oPrV6J",
+    symbol: "SOL-PERP",
+    name: "SOL/USD Perpetual",
+  },
+];
+
+function getApiBaseUrl(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  return new URL("/api", window.location.origin).toString();
+}
+
+async function discoverPortfolioMarkets(
+  connection: ReturnType<typeof useConnectionCompat>["connection"],
+  programId: PublicKey,
+): Promise<DiscoveredMarket[]> {
+  const network = getNetwork();
+  const apiBaseUrl = getApiBaseUrl();
+
+  if (apiBaseUrl) {
+    const viaApi = await discoverMarketsViaProgramDirectory(connection, programId, apiBaseUrl, {
+      timeoutMs: 8_000,
+    }).catch(() => [] as DiscoveredMarket[]);
+    if (viaApi.length > 0) return viaApi;
+  }
+
+  if (network === "mainnet") {
+    const viaStatic = await discoverMarketsViaStaticBundle(
+      connection,
+      programId,
+      MAINNET_STATIC_MARKETS,
+    ).catch(() => [] as DiscoveredMarket[]);
+    if (viaStatic.length > 0) return viaStatic;
+  }
+
+  return [];
+}
 
 export interface PortfolioPosition {
   slabAddress: string;
@@ -29,6 +67,12 @@ export interface PortfolioPosition {
   account: Account;
   idx: number;
   market: DiscoveredMarket;
+  /**
+   * Effective entry price in e6 format.
+   * V12_1 removed entry_price from the on-chain struct; falls back to
+   * localStorage (saved at trade time) when account.entryPrice is 0.
+   */
+  effectiveEntryPrice: bigint;
   /** Last effective oracle price in e6 format */
   oraclePriceE6: bigint;
   /** Liquidation price in e6 format */
@@ -39,7 +83,7 @@ export interface PortfolioPosition {
   unrealizedPnl: bigint;
   /** PnL as percentage of capital */
   pnlPercent: number;
-  /** Effective leverage (position notional / capital) */
+  /** Risk leverage (position notional / slab account capital) */
   leverage: number;
   /** Maintenance margin bps for this market */
   maintenanceMarginBps: bigint;
@@ -71,7 +115,7 @@ export interface PortfolioData {
 
 /**
  * Fetches all markets and finds positions for the connected wallet.
- * Enriches each position with liquidation price, PnL %, and leverage.
+ * Enriches each position with liquidation price, PnL %, and risk leverage.
  */
 export function usePortfolio(): PortfolioData {
   const { connection } = useConnectionCompat();
@@ -113,11 +157,7 @@ export function usePortfolio(): PortfolioData {
     }
 
     let cancelled = false;
-    const cfg = getConfig();
-    const programIds = new Set<string>();
-    if (cfg.programId) programIds.add(cfg.programId);
-    const byTier = (cfg as any).programsBySlabTier as Record<string, string> | undefined;
-    if (byTier) Object.values(byTier).forEach((id) => { if (id) programIds.add(id); });
+    const programIds = getAllProgramIds();
     const pkStr = publicKey.toBase58();
 
     async function load() {
@@ -128,7 +168,7 @@ export function usePortfolio(): PortfolioData {
           setLoading(true);
         }
         const marketArrays = await Promise.all(
-          [...programIds].map((id) => discoverMarkets(connection, new PublicKey(id)).catch(() => []))
+          programIds.map((id) => discoverPortfolioMarkets(connection, new PublicKey(id)))
         );
         const markets = marketArrays.flat();
         const allPositions: PortfolioPosition[] = [];
@@ -188,9 +228,16 @@ export function usePortfolio(): PortfolioData {
 
             for (const { idx, account } of accounts) {
               if (account.kind === AccountKind.User && account.owner.toBase58() === pkStr) {
+                // V12_1: entry_price was removed from on-chain struct. Fall back to
+                // localStorage (saved by TradeForm at trade time) so portfolio PnL
+                // and liq-price compute correctly instead of showing 0/—.
+                const slabAddrStr = market.slabAddress.toBase58();
+                const effectiveEntryPrice =
+                  account.entryPrice > 0n ? account.entryPrice : getEntryPrice(slabAddrStr, idx);
+
                 // Compute liquidation price
                 const liquidationPriceE6 = computeLiqPrice(
-                  account.entryPrice,
+                  effectiveEntryPrice,
                   account.capital,
                   account.positionSize,
                   maintenanceMarginBps,
@@ -200,8 +247,8 @@ export function usePortfolio(): PortfolioData {
                 // GH#1331: account.pnl can be u64::MAX sentinel for uninitialized/flat
                 // positions. Guard it with isSentinelValue to prevent billion-dollar
                 // phantom PnL on the dashboard when oracle price is unavailable.
-                const unrealizedPnl = oraclePriceE6 > 0n
-                  ? computeMarkPnl(account.positionSize, account.entryPrice, oraclePriceE6)
+                const unrealizedPnl = oraclePriceE6 > 0n && effectiveEntryPrice > 0n
+                  ? computeMarkPnl(account.positionSize, effectiveEntryPrice, oraclePriceE6)
                   : (isSentinelValue(account.pnl) ? 0n : account.pnl);
 
                 // PnL percentage
@@ -223,13 +270,12 @@ export function usePortfolio(): PortfolioData {
                   }
                 }
 
-                // Leverage = notional / capital
+                // Risk leverage = notional / slab account capital.
                 const absPos = account.positionSize < 0n ? -account.positionSize : account.positionSize;
                 let leverage = 0;
                 if (account.capital > 0n && oraclePriceE6 > 0n) {
-                  // notional = absPos * price / price (coin-margined) = absPos
-                  // For coin-margined: leverage = absPos / capital
-                  leverage = Number((absPos * 100n) / account.capital) / 100;
+                  // notional_usd = contracts * price; leverage = notional_usd / capital
+                  leverage = Number((absPos * oraclePriceE6 / 1_000_000n) * 100n / account.capital) / 100;
                 }
 
                 // Track liquidation risk
@@ -238,11 +284,12 @@ export function usePortfolio(): PortfolioData {
                 }
 
                 allPositions.push({
-                  slabAddress: market.slabAddress.toBase58(),
+                  slabAddress: slabAddrStr,
                   symbol: null,
                   account,
                   idx,
                   market,
+                  effectiveEntryPrice,
                   oraclePriceE6,
                   liquidationPriceE6,
                   liquidationDistancePct,
@@ -276,9 +323,11 @@ export function usePortfolio(): PortfolioData {
             const bSev = getLiquidationSeverity(b.liquidationDistancePct);
             const sevOrder = { danger: 0, warning: 1, safe: 2 };
             if (sevOrder[aSev] !== sevOrder[bSev]) return sevOrder[aSev] - sevOrder[bSev];
-            // Then by PnL
-            const pnlDiff = Number(b.unrealizedPnl - a.unrealizedPnl);
-            if (pnlDiff !== 0) return pnlDiff;
+            // Then by PnL — bigint compare to avoid Number() precision loss
+            // (positions with PnL > Number.MAX_SAFE_INTEGER would otherwise
+            // produce a garbage sign and shuffle on each refresh).
+            if (b.unrealizedPnl > a.unrealizedPnl) return 1;
+            if (b.unrealizedPnl < a.unrealizedPnl) return -1;
             // Stable tiebreaker: sort by slab address to prevent random reordering
             return a.slabAddress.localeCompare(b.slabAddress);
           });

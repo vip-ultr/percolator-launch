@@ -12,7 +12,7 @@ import { NextResponse } from "next/server";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getServiceClient, getServerNetwork } from "@/lib/supabase";
 import { getRpcEndpoint } from "@/lib/config";
-import { getStakeProgramId } from "@percolator/sdk";
+import { getStakeProgramId } from "@percolatorct/sdk";
 import * as Sentry from "@sentry/nextjs";
 
 // ── APR helpers ───────────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ const MS_PER_DAY = 86_400_000;
 interface InsuranceSnapshotRow {
   slab: string;
   redemption_rate_e6: number;
-  created_at: string;
+  created_at: string | null;
 }
 
 /**
@@ -52,8 +52,7 @@ async function computeAprs(
   const since7d = new Date(now - 7 * MS_PER_DAY).toISOString();
   const since30d = new Date(now - 30 * MS_PER_DAY).toISOString();
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const db = supabase as any;
+  const db = supabase;
 
   // PERC-8195: filter by network so devnet/mainnet rows don't mix
   const networkFilter = getServerNetwork();
@@ -91,7 +90,7 @@ async function computeAprs(
   ]);
 
   // Handle network column fallback for all three queries in parallel
-  const networkFallbackPromises: Promise<{ data: InsuranceSnapshotRow[] | null }>[] = [];
+  const networkFallbackPromises: PromiseLike<{ data: InsuranceSnapshotRow[] | null }>[] = [];
   
   if (result7d.error && result7d.error.message?.includes("network")) {
     networkFallbackPromises.push(
@@ -158,7 +157,7 @@ async function computeAprs(
     if (!earliest7dBySlab.has(row.slab)) {
       earliest7dBySlab.set(row.slab, {
         rate: Number(row.redemption_rate_e6),
-        ts: new Date(row.created_at).getTime(),
+        ts: new Date(row.created_at ?? 0).getTime(),
       });
     }
   }
@@ -166,7 +165,7 @@ async function computeAprs(
     if (!earliest30dBySlab.has(row.slab)) {
       earliest30dBySlab.set(row.slab, {
         rate: Number(row.redemption_rate_e6),
-        ts: new Date(row.created_at).getTime(),
+        ts: new Date(row.created_at ?? 0).getTime(),
       });
     }
   }
@@ -174,7 +173,7 @@ async function computeAprs(
     if (!latestBySlab.has(row.slab)) {
       latestBySlab.set(row.slab, {
         rate: Number(row.redemption_rate_e6),
-        ts: new Date(row.created_at).getTime(),
+        ts: new Date(row.created_at ?? 0).getTime(),
       });
     }
   }
@@ -327,7 +326,10 @@ export async function GET() {
     // when the stake program hasn't been deployed yet.
     let stakeProgramId: PublicKey;
     try {
-      stakeProgramId = getStakeProgramId();
+      // Use the mainnet stake program directly. The SDK's env-based detection
+      // and getServerNetwork() both fail in Vercel API routes when
+      // NEXT_PUBLIC_DEFAULT_NETWORK is set to devnet or not inlined at build time.
+      stakeProgramId = new PublicKey("DC5fovFQD5SZYsetwvEqd4Wi4PFY1Yfnc669VMe6oa7F");
     } catch {
       // Stake program not available on this network — return empty pools
       return NextResponse.json({ pools: [] }, {
@@ -349,11 +351,16 @@ export async function GET() {
     }
 
     // 2. Parse binary data
-    const parsed: Array<{ pubkey: string; pool: ParsedStakePool }> = [];
+    const allParsed: Array<{ pubkey: string; pool: ParsedStakePool }> = [];
     for (const { pubkey, account } of rawAccounts) {
       const pool = parseStakePool(Buffer.from(account.data));
-      if (pool) parsed.push({ pubkey: pubkey.toBase58(), pool });
+      if (pool) allParsed.push({ pubkey: pubkey.toBase58(), pool });
     }
+
+    // 2b. Filter out orphan pools whose slab no longer exists on-chain
+    const slabKeys = allParsed.map(p => new PublicKey(p.pool.slab));
+    const slabInfos = await connection.getMultipleAccountsInfo(slabKeys);
+    const parsed = allParsed.filter((_, i) => slabInfos[i] !== null);
 
     // 3. Fetch vault token balances (SPL token amount in each vault)
     const vaultAddresses = parsed.map((p) => p.pool.vault);

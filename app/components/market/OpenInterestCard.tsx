@@ -82,19 +82,18 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
         setError(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
-        // Fallback to on-chain data when API unavailable
+        // Fallback to on-chain data when API unavailable.
+        // Use engine.longOi/shortOi directly — the old formula deriving from
+        // totalOI + netLpPos produced negative/wrong values (showed -50% long).
         if (engine) {
-          const totalOi = engine.totalOpenInterest?.toString() ?? "0";
-          const netLp = engine.netLpPos ?? 0n;
-          const totalOiBn = engine.totalOpenInterest ?? 0n;
-          const netLpBn = netLp < 0n ? -netLp : netLp;
-          const longOi = totalOiBn > netLpBn ? (totalOiBn + netLp) / 2n : 0n;
-          const shortOi = totalOiBn > netLpBn ? (totalOiBn - netLp) / 2n : 0n;
+          const longOi = engine.longOi ?? 0n;
+          const shortOi = engine.shortOi ?? 0n;
+          const totalOi = (longOi + shortOi).toString();
           setOiData({
             totalOi,
-            longOi: (longOi < 0n ? 0n : longOi).toString(),
-            shortOi: (shortOi < 0n ? 0n : shortOi).toString(),
-            netLpPosition: netLp.toString(),
+            longOi: longOi.toString(),
+            shortOi: shortOi.toString(),
+            netLpPosition: (engine.netLpPos ?? 0n).toString(),
             historicalOi: [],
           });
         }
@@ -189,7 +188,7 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
     );
   }
 
-  if (!oiData || !oiData.totalOi || !oiData.longOi || !oiData.shortOi || !oiData.netLpPosition) {
+  if (!oiData) {
     return (
       <div className="rounded-none border border-[var(--border)]/50 bg-[var(--bg)]/80 p-3">
         <div className="flex items-center justify-between">
@@ -202,10 +201,10 @@ export const OpenInterestCard: FC<{ slabAddress: string }> = ({
     );
   }
 
-  const totalOiUsd = formatUsdAmount(oiData.totalOi, tokenDecimals);
-  const longOiUsd = formatUsdAmount(oiData.longOi, tokenDecimals);
-  const shortOiUsd = formatUsdAmount(oiData.shortOi, tokenDecimals);
-  const lpNetUsd = formatSignedUsdAmount(oiData.netLpPosition, tokenDecimals);
+  const totalOiUsd = formatUsdAmount(oiData.totalOi || "0", tokenDecimals);
+  const longOiUsd = formatUsdAmount(oiData.longOi || "0", tokenDecimals);
+  const shortOiUsd = formatUsdAmount(oiData.shortOi || "0", tokenDecimals);
+  const lpNetUsd = formatSignedUsdAmount(oiData.netLpPosition || "0", tokenDecimals);
   const lpDirection = BigInt(oiData.netLpPosition ?? "0") >= 0n ? "long" : "short";
 
   return (

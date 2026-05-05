@@ -8,6 +8,7 @@ import { SlabProvider, useSlabState } from "@/components/providers/SlabProvider"
 import { UsdToggleProvider, useUsdToggle } from "@/components/providers/UsdToggleProvider";
 import { TradeForm } from "@/components/trade/TradeForm";
 import { PositionPanel } from "@/components/trade/PositionPanel";
+import { PositionNftPanel } from "@/components/trade/PositionNftPanel";
 import { PositionsTable } from "@/components/trade/PositionsTable";
 import { AccountsCard } from "@/components/trade/AccountsCard";
 import { DepositTrigger } from "@/components/trade/DepositTrigger";
@@ -18,15 +19,14 @@ import { TradingChart } from "@/components/trade/TradingChart";
 import { MarketInfoBar } from "@/components/trade/MarketInfoBar";
 import { useIsLargeScreen } from "@/hooks/useIsLargeScreen";
 import { useAdvanceOraclePhase } from "@/hooks/useAdvanceOraclePhase";
+import { useOrderBookVisibility } from "@/hooks/useOrderBookVisibility";
 import { TradeHistory } from "@/components/trade/TradeHistory";
 import { LiquidationAnalytics } from "@/components/trade/LiquidationAnalytics";
 import { AdlLeaderboard } from "@/components/trade/AdlLeaderboard";
 import { CrankHealthCard } from "@/components/trade/CrankHealthCard";
-import { KeeperFundCard } from "@/components/market/KeeperFundCard";
 import { SystemCapitalCard } from "@/components/trade/SystemCapitalCard";
 import { OpenInterestCard } from "@/components/market/OpenInterestCard";
 import { InsuranceDashboard } from "@/components/market/InsuranceDashboard";
-import { InsuranceLPPanel } from "@/components/trade/InsuranceLPPanel";
 import { HealthBadge } from "@/components/market/HealthBadge";
 import { ShareButton } from "@/components/market/ShareCard";
 import { MarketLogo } from "@/components/market/MarketLogo";
@@ -156,6 +156,7 @@ function TradePageInner({ slab }: { slab: string }) {
   // CSS-only hidden/shown dual-mount caused two ChartEmptyState instances to stack
   // during SSR/hydration before the responsive classes were applied (P0 render bug).
   const isLargeScreen = useIsLargeScreen();
+  const [orderBookVisible, toggleOrderBook] = useOrderBookVisibility();
 
   const { engine, config, header, accounts, loading: slabLoading, error: slabError } = useSlabState();
   useAdvanceOraclePhase(slab);
@@ -188,15 +189,22 @@ function TradePageInner({ slab }: { slab: string }) {
     return () => { cancelled = true; };
   }, [slab]);
 
-  // Resolve symbol: on-chain (useTokenMeta) → Supabase → truncated address
-  const mintAddress = config?.collateralMint?.toBase58() ?? "";
+  // Resolve symbol: Supabase market symbol (trading pair) → on-chain (collateral) → truncated address
+  // BUG FIX: Supabase symbol represents the TRADING PAIR (e.g. "SOL"), while on-chain
+  // tokenMeta symbol is the COLLATERAL token (e.g. "USDC"). Previously on-chain was
+  // preferred, causing a USDC-collateralized SOL market to show as "USDC/USD".
+  const collateralMintAddress = config?.collateralMint?.toBase58() ?? "";
+  // BUG FIX: Use the trading pair's base asset mint (mainnet_ca from Supabase) for the chart
+  // and logo, NOT the collateral mint. A SOL/USD perp collateralized in USDC should show
+  // SOL candles in the chart, not USDC candles.
+  const mintAddress = supabaseMarket?.mainnet_ca ?? collateralMintAddress;
   const onChainSymbol = tokenMeta?.symbol ?? null;
   const supabaseSymbol = supabaseMarket?.symbol ?? null;
   const symbol = (() => {
-    // 1. On-chain symbol (if it's a real name, not a truncated address)
-    if (!isPlaceholderSymbol(onChainSymbol, mintAddress)) return onChainSymbol!;
-    // 2. Supabase symbol (if it's a real name, not a placeholder)
+    // 1. Supabase symbol (market trading pair — authoritative for display)
     if (!isPlaceholderSymbol(supabaseSymbol, mintAddress)) return supabaseSymbol!;
+    // 2. On-chain symbol (collateral token — fallback when no DB entry)
+    if (!isPlaceholderSymbol(onChainSymbol, mintAddress)) return onChainSymbol!;
     // 3. Fallback: truncated mint address
     if (config?.collateralMint) {
       const b58 = config.collateralMint.toBase58();
@@ -464,14 +472,24 @@ function TradePageInner({ slab }: { slab: string }) {
           </Collapsible>
         </ErrorBoundary>
 
+        {/* Position NFT */}
+        <ErrorBoundary label="PositionNftPanel">
+          <Collapsible title="Position NFT" defaultOpen={false}>
+            <PositionNftPanel slabAddress={slab} />
+          </Collapsible>
+        </ErrorBoundary>
+
         <ErrorBoundary label="AccountsCard">
           <Collapsible title="Positions & Liqs" defaultOpen={false}>
             <AccountsCard />
           </Collapsible>
         </ErrorBoundary>
 
-        {/* Bottom tabs: Stats | Trades | Health | Risk | ADL | Book */}
-        <Tabs tabs={["Stats", "Trades", "Health", "Risk", "ADL", "Book"]}>
+        {/* Bottom tabs — "Book" tab only appears when the user has opted-in.
+            Toggle persists via useOrderBookVisibility (localStorage). */}
+        <Tabs tabs={orderBookVisible
+          ? ["Stats", "Trades", "Health", "Risk", "ADL", "Book"]
+          : ["Stats", "Trades", "Health", "Risk", "ADL"]}>
           <ErrorBoundary label="MarketStatsCard"><MarketStatsCard /></ErrorBoundary>
           <ErrorBoundary label="TradeHistory"><TradeHistory slabAddress={slab} /></ErrorBoundary>
           <ErrorBoundary label="EngineHealthCard">
@@ -481,31 +499,49 @@ function TradePageInner({ slab }: { slab: string }) {
           <ErrorBoundary label="RiskAnalytics">
             <OpenInterestCard slabAddress={slab} />
             <div className="mt-2"><InsuranceDashboard slabAddress={slab} /></div>
-            <div className="mt-2"><InsuranceLPPanel /></div>
             <div className="mt-2"><CrankHealthCard /></div>
-            <div className="mt-2"><KeeperFundCard /></div>
             <div className="mt-2"><LiquidationAnalytics /></div>
             <div className="mt-2"><SystemCapitalCard /></div>
           </ErrorBoundary>
           <ErrorBoundary label="AdlLeaderboard">
             <AdlLeaderboard slabAddress={slab} />
           </ErrorBoundary>
-          <ErrorBoundary label="MarketBookCard"><MarketBookCard /></ErrorBoundary>
+          {orderBookVisible && (
+            <ErrorBoundary label="MarketBookCard"><MarketBookCard /></ErrorBoundary>
+          )}
         </Tabs>
+        {!orderBookVisible && (
+          <button
+            type="button"
+            onClick={toggleOrderBook}
+            className="mt-2 w-full rounded-none border border-[var(--border)]/40 bg-[var(--bg)]/40 px-3 py-1.5 text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)] hover:border-[var(--accent)]/30 hover:text-[var(--text-secondary)]"
+          >
+            ⟨ Show order book
+          </button>
+        )}
       </div>
 
       {/* ════════════════════════════════════════════════════════
           DESKTOP LAYOUT  (≥ lg / 1024px)
-          Two columns: left ~68%, right ~32%
+          Three columns when order book visible, two when collapsed.
+          Middle column (Book) can be toggled off via the × on the book
+          or the "Show order book" button rendered inline.
           ════════════════════════════════════════════════════════ */}
-      <div className="hidden lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(0,220px)_minmax(0,340px)] gap-4 px-4 lg:px-6 pb-3 pt-2">
+      <div className={`hidden lg:grid gap-4 px-4 lg:px-6 pb-3 pt-2 ${
+        orderBookVisible
+          ? "lg:grid-cols-[minmax(0,1fr)_minmax(0,220px)_minmax(0,340px)]"
+          : "lg:grid-cols-[minmax(0,1fr)_minmax(0,340px)]"
+      }`}>
         {/* ── Left column: Chart + Positions ── */}
-        <div className="min-w-0 flex flex-col gap-1.5">
+        <div className="min-w-0 flex flex-col gap-0">
           {/* Chart — only mount on desktop to prevent dual ChartEmptyState stacking */}
           {isLargeScreen && (
             <ErrorBoundary label="TradingChart">
-              {/* overflow-hidden prevents lightweight-charts toolbar from escaping chart bounds (GH#1647) */}
-              <div className="flex-1 min-h-[500px] overflow-hidden">
+              {/* Chart height bumped 500 → 640 so the time axis + price axis
+                  labels + volume pane can all render without clipping against
+                  the container edges. Component internals (TradingChart.tsx)
+                  also set w-full h-full so autoSize: true fills this wrapper. */}
+              <div className="h-[640px] overflow-hidden">
                 <TradingChart slabAddress={slab} mintAddress={mintAddress || undefined} />
               </div>
             </ErrorBoundary>
@@ -518,12 +554,14 @@ function TradePageInner({ slab }: { slab: string }) {
           </Tabs>
         </div>
 
-        {/* ── Middle column: Order Book ── */}
-        <div className="min-w-0">
-          <ErrorBoundary label="MarketBookCard">
-            <MarketBookCard />
-          </ErrorBoundary>
-        </div>
+        {/* ── Middle column: Order Book (toggleable) ── */}
+        {orderBookVisible && (
+          <div className="min-w-0">
+            <ErrorBoundary label="MarketBookCard">
+              <MarketBookCard />
+            </ErrorBoundary>
+          </div>
+        )}
 
         {/* ── Right column: Trade Panel ── */}
         <div className="min-w-0 space-y-1.5">
@@ -533,6 +571,9 @@ function TradePageInner({ slab }: { slab: string }) {
             </ErrorBoundary>
             <ErrorBoundary label="TradeForm">
               <TradeForm slabAddress={slab} />
+            </ErrorBoundary>
+            <ErrorBoundary label="PositionNftPanel">
+              <PositionNftPanel slabAddress={slab} />
             </ErrorBoundary>
           </div>
 
@@ -547,8 +588,6 @@ function TradePageInner({ slab }: { slab: string }) {
             <ErrorBoundary label="RiskAnalytics">
               <OpenInterestCard slabAddress={slab} />
               <div className="mt-1.5"><InsuranceDashboard slabAddress={slab} /></div>
-              <div className="mt-1.5"><InsuranceLPPanel /></div>
-              <div className="mt-1.5"><KeeperFundCard /></div>
               <div className="mt-1.5"><LiquidationAnalytics /></div>
               <div className="mt-1.5"><SystemCapitalCard /></div>
             </ErrorBoundary>
@@ -556,6 +595,15 @@ function TradePageInner({ slab }: { slab: string }) {
               <AdlLeaderboard slabAddress={slab} />
             </ErrorBoundary>
           </Tabs>
+          {!orderBookVisible && (
+            <button
+              type="button"
+              onClick={toggleOrderBook}
+              className="w-full rounded-none border border-[var(--border)]/40 bg-[var(--bg)]/40 px-3 py-1.5 text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)] hover:border-[var(--accent)]/30 hover:text-[var(--text-secondary)]"
+            >
+              ⟨ Show order book
+            </button>
+          )}
         </div>
       </div>
 

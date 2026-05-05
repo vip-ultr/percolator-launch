@@ -29,9 +29,13 @@ export interface OracleFreshnessState {
   lastUpdateMs: number | null;
 }
 
-/** Freshness thresholds in seconds */
-const FRESH_THRESHOLD = 5;
-const AGING_THRESHOLD = 30;
+/** Freshness thresholds in seconds.
+ * Hyperp markets are cranked every ~30s but the slab poll interval is longer,
+ * so the frontend may not see a price change for 60-90s. Use generous thresholds
+ * to avoid false "ORACLE STALE" warnings that block trading.
+ */
+const FRESH_THRESHOLD = 30;
+const AGING_THRESHOLD = 60;
 
 function getFreshnessLevel(elapsedSecs: number): FreshnessLevel {
   if (elapsedSecs < FRESH_THRESHOLD) return "fresh";
@@ -70,7 +74,7 @@ function getModeLabel(mode: OracleMode): string {
  * For hyperp/pyth modes: tracks when lastEffectivePriceE6 last changed.
  */
 export function useOracleFreshness(): OracleFreshnessState {
-  const { config } = useSlabState();
+  const { config, engine } = useSlabState();
   const [elapsedSecs, setElapsedSecs] = useState(0);
   const [lastUpdateMs, setLastUpdateMs] = useState<number | null>(null);
   const prevPriceRef = useRef<bigint | null>(null);
@@ -132,12 +136,26 @@ export function useOracleFreshness(): OracleFreshnessState {
       if (prevPriceRef.current !== null && currentPrice !== prevPriceRef.current) {
         setLastUpdateMs(Date.now());
       } else if (prevPriceRef.current === null && currentPrice > 0n) {
-        // First load — assume relatively fresh
-        setLastUpdateMs(Date.now());
+        // First load — estimate actual staleness from on-chain slot data rather
+        // than assuming the price is fresh. engine.currentSlot is the slot at the
+        // time the slab was last written; engine.lastCrankSlot is the slot of the
+        // last oracle crank. The difference, multiplied by ~400ms/slot, gives the
+        // elapsed time since the last real update.
+        if (engine != null && engine.currentSlot > 0n && engine.lastCrankSlot > 0n) {
+          const slotDelta = Number(engine.currentSlot - engine.lastCrankSlot);
+          const estimatedElapsedMs = Math.max(0, slotDelta) * 400;
+          setLastUpdateMs(Date.now() - estimatedElapsedMs);
+        } else {
+          // engine data not yet loaded — optimistically treat as fresh.
+          // The elapsed timer will advance naturally; if the price doesn't change
+          // it will age to "aging"/"stale" on its own. This avoids a false stale
+          // warning on first render before engine state is available.
+          setLastUpdateMs(Date.now());
+        }
       }
       prevPriceRef.current = currentPrice;
     }
-  }, [config]);
+  }, [config, engine]);
 
   // Tick every second to update elapsed time
   useEffect(() => {

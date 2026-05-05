@@ -12,6 +12,29 @@
  * When a Solana transaction fails with a Percolator custom error, the error code number
  * is extracted and looked up here to display context-appropriate text to the user.
  */
+// ── Lighthouse/Blowfish detection (PERC-8445) ──────────────────────────────
+import { LIGHTHOUSE_PROGRAM_ID } from "@/lib/tx";
+// Lighthouse v2 (Blowfish wallet guard) injects assertion IXs that fail with 0x1900
+// (Anchor ConstraintAddress). This is NOT a Percolator error.
+const LIGHTHOUSE_PROGRAM_ID_STR = LIGHTHOUSE_PROGRAM_ID;
+
+const LIGHTHOUSE_USER_MESSAGE =
+  "Your wallet's transaction guard (Blowfish/Lighthouse) is blocking this transaction. " +
+  "This is a known compatibility issue — the transaction itself is valid. " +
+  "Try one of these workarounds:\n" +
+  "1. Disable transaction simulation in your wallet settings\n" +
+  "2. Use a wallet without Blowfish protection (e.g., Backpack, Solflare)\n" +
+  "3. The SDK will automatically retry without the guard";
+
+function isLighthouseError(msg: string): boolean {
+  if (msg.includes(LIGHTHOUSE_PROGRAM_ID_STR)) return true;
+  if (/custom\s+program\s+error:\s*0x1900\b/i.test(msg)) return true;
+  if (/"Custom"\s*:\s*6400\b/.test(msg) && /InstructionError/i.test(msg)) return true;
+  return false;
+}
+
+export { LIGHTHOUSE_USER_MESSAGE };
+
 const ERROR_CODE_MAP: Record<number, string> = {
   0: "Invalid market magic — data corrupted.",
   1: "This market was created with an older program version and needs migration. The program has been upgraded — please contact the market admin to migrate this market, or create a new market with the current program.",
@@ -63,6 +86,48 @@ const ERROR_CODE_MAP: Record<number, string> = {
 /** Legacy Anchor error map (unused but kept for compatibility) */
 const CUSTOM_ERROR_MAP: Record<number, string> = {};
 
+/**
+ * percolator-nft program error codes (percolator-nft/src/error.rs).
+ * These overlap numerically with percolator-prog's error codes, so we must
+ * route by originating program id before looking up a human message — e.g.
+ * code 10 on percolator-prog is "Missing required signer" but on percolator-nft
+ * it is "Slab layout not recognized".
+ */
+const NFT_ERROR_CODE_MAP: Record<number, string> = {
+  0: "Position is not open (size is zero).",
+  1: "NFT already minted for this position.",
+  2: "NFT PDA does not match expected derivation — frontend/program version mismatch.",
+  3: "Slab account not owned by the Percolator program.",
+  4: "Slab data too short — corrupted or unsupported market.",
+  5: "User index out of range for this slab.",
+  6: "Position has changed since NFT was minted (entry-price mismatch).",
+  7: "Only the NFT holder can burn / settle this position.",
+  8: "Funding settlement overflow.",
+  9: "Invalid mint authority — expected program PDA.",
+  10: "NFT program cannot parse this market's slab layout — the NFT program is out of date relative to the deployed main program. An on-chain NFT program upgrade is required.",
+  11: "Cannot transfer — position is being liquidated.",
+  12: "Funding must be settled before transfer.",
+  13: "Transfer hook: unknown Percolator program.",
+  14: "Position must be fully closed (size and collateral at zero) before burn.",
+  15: "Transfer hook: extra-metas PDA does not match expected derivation.",
+  16: "Transfer hook: source or destination token account invalid.",
+  17: "Transfer hook was invoked directly, not via Token-2022 CPI.",
+  18: "This account is an LP account and cannot be wrapped as an NFT — only trading accounts are eligible.",
+  19: "Account id mismatch — slot was reallocated to a different account.",
+  20: "Slab slot was closed and reassigned to a different owner after this NFT was minted — the NFT no longer represents that position.",
+};
+
+/** Hard-coded NFT program id. Matches app/lib/nft-program.ts. Kept here to
+ *  avoid importing the (client-only) PublicKey wrapper from this module. */
+const NFT_PROGRAM_ID = "FqhKJT9gtScjrmfUuRMjeg7cXNpif1fqsy5Jh65tJmTS";
+
+function isNftProgramError(msg: string): boolean {
+  if (msg.includes(NFT_PROGRAM_ID)) return true;
+  // Our useMintPositionNft handler tags simulation failures with this prefix.
+  if (msg.includes("NFT mint simulation failed")) return true;
+  return false;
+}
+
 function extractErrorCode(msg: string): number | null {
   const m = msg.match(/(?:custom program error|Error Code)[:\s]+0x([0-9a-fA-F]+)/i);
   if (m) return parseInt(m[1], 16);
@@ -109,14 +174,42 @@ export function humanizeError(rawMsg: string): string {
     console.warn("[humanizeError] raw:", rawMsg);
   }
 
+  // PERC-8445: Lighthouse/Blowfish detection MUST run before generic hex extraction.
+  // 0x1900 is Anchor ConstraintAddress from Lighthouse, NOT a Percolator error code.
+  if (isLighthouseError(rawMsg)) {
+    return LIGHTHOUSE_USER_MESSAGE;
+  }
+
+  // Handle Solana system errors BEFORE custom code extraction.
+  // These are string-form errors like "InvalidAccountData", "AccountAlreadyInitialized" etc.
+  // They must NOT be confused with Percolator custom program error codes.
+  if (rawMsg.includes('"InvalidAccountData"')) {
+    return "Invalid account data — one of the accounts has unexpected data. The transaction may need different accounts or the market state may have changed.";
+  }
+  if (rawMsg.includes('"AccountAlreadyInitialized"')) {
+    return "Account already exists — this operation was already completed.";
+  }
+  if (rawMsg.includes('"AccountNotFound"') || rawMsg.includes("AccountNotFound")) {
+    return "Account not found on-chain. It may have been closed or not yet created.";
+  }
+  if (rawMsg.includes("insufficient account keys")) {
+    return "Missing accounts in transaction — this is likely a frontend bug. Please report it.";
+  }
+
   const code = extractErrorCode(rawMsg);
-  if (code !== null && ERROR_CODE_MAP[code]) {
-    // Also extract which instruction failed for context
-    const ixMatch = rawMsg.match(/"InstructionError"\s*:\s*\[\s*(\d+)/);
-    const ixIdx = ixMatch ? parseInt(ixMatch[1], 10) : null;
-    const ixLabels = ["compute budget", "priority fee", "oracle push", "crank", "trade"];
-    const ixHint = ixIdx !== null && ixIdx < ixLabels.length ? ` (in ${ixLabels[ixIdx]})` : "";
-    return ERROR_CODE_MAP[code] + ixHint;
+  // Route the code to the right per-program table. The NFT program and the
+  // main Percolator program reuse the same small integers for different
+  // errors, so a generic lookup would mislabel NFT errors (e.g. code 10 is
+  // "Missing required signer" in the main program but "Slab layout not
+  // recognized" in the NFT program — a user who sees the former assumes a
+  // wallet/signing bug instead of an on-chain program mismatch).
+  if (code !== null) {
+    if (isNftProgramError(rawMsg) && NFT_ERROR_CODE_MAP[code]) {
+      return NFT_ERROR_CODE_MAP[code];
+    }
+    if (ERROR_CODE_MAP[code]) {
+      return ERROR_CODE_MAP[code];
+    }
   }
   const customIdx = extractCustomIndex(rawMsg);
   if (customIdx !== null && CUSTOM_ERROR_MAP[customIdx]) {
@@ -134,6 +227,20 @@ export function humanizeError(rawMsg: string): string {
   // Error code 1 can be either PercolatorError::InvalidVersion OR SPL Token InsufficientFunds from CPI
   if (rawMsg.includes("User rejected")) {
     return "Transaction cancelled.";
+  }
+  // spl-token throws these typed errors without any .message so they bubble
+  // up as the raw class name. Give each one a human sentence.
+  if (rawMsg.includes("TokenAccountNotFoundError")) {
+    return "Token account not found on the RPC this page is connected to. The wallet may hold the NFT from a different network, or the RPC may be out of sync — try refreshing the page.";
+  }
+  if (rawMsg.includes("TokenInvalidAccountOwnerError")) {
+    return "Token account has the wrong on-chain owner. This usually means the frontend is pointed at a cluster where this mint was not created.";
+  }
+  if (rawMsg.includes("TokenInvalidMintError")) {
+    return "Mint account is not a valid SPL Token / Token-2022 mint. Refresh and verify the position NFT panel still shows a valid mint.";
+  }
+  if (rawMsg.includes("TokenTransferHookAccountNotFound")) {
+    return "Transfer-hook metadata account missing. This NFT was minted before a recent hook-fix upgrade; open a support ticket so we can run RepairExtraAccountMetas on it.";
   }
   if (rawMsg.includes("timeout") || rawMsg.includes("Timeout")) {
     return "Transaction timed out. It may still confirm — check your wallet.";

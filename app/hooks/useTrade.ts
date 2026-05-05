@@ -5,20 +5,27 @@ import { PublicKey } from "@solana/web3.js";
 import { useWalletCompat, useConnectionCompat } from "@/hooks/useWalletCompat";
 import {
   encodeTradeCpi,
-  encodeTradeCpiV2,
   encodeKeeperCrank,
-  encodePushOraclePrice,
   ACCOUNTS_TRADE_CPI,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   buildAccountMetas,
   buildIx,
   deriveLpPda,
   derivePythPushOraclePDA,
   WELL_KNOWN,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
+// TODO(oracle-migration): encodePushOraclePrice/ACCOUNTS_PUSH_ORACLE_PRICE removed in beta.29.
+// The DEX oracle inline push path needs to migrate to /api/oracle/advance-phase.
+import {
+  encodePushOraclePrice,
+  ACCOUNTS_PUSH_ORACLE_PRICE,
+} from "@/lib/sdk-compat";
 import { sendTx } from "@/lib/tx";
 import { useSlabState } from "@/components/providers/SlabProvider";
+import { detectOracleMode } from "@/lib/oraclePrice";
+
+const INLINE_ORACLE_PUSH_REMOVED_ERROR =
+  "Inline oracle price push was removed on-chain in beta.29. Migrate this flow to /api/oracle/advance-phase or another server-side oracle publisher before trading as the oracle authority.";
 
 export function useTrade(slabAddress: string) {
   const { connection } = useConnectionCompat();
@@ -29,7 +36,7 @@ export function useTrade(slabAddress: string) {
   const inflightRef = useRef(false);
 
   const trade = useCallback(
-    async (params: { lpIdx: number; userIdx: number; size: bigint }) => {
+    async (params: { lpIdx: number; userIdx: number; size: bigint; limitPriceE6?: bigint }) => {
       if (inflightRef.current) throw new Error("Trade already in progress");
       inflightRef.current = true;
       setLoading(true);
@@ -39,36 +46,15 @@ export function useTrade(slabAddress: string) {
         const lpAccount = accounts.find((a) => a.idx === params.lpIdx);
         if (!lpAccount) throw new Error(`LP at index ${params.lpIdx} not found`);
 
-        // NOTE: Matcher context validation disabled - all current markets have default matcher context
-        // which is valid for non-vAMM LPs. If matcher context issues arise, the program will
-        // return a proper error instead of blocking all trades upfront.
-        // Original validation from commit 919f006 (Feb 10) was too strict.
-        
-        // const matcherCtxKey = lpAccount.account.matcherContext;
-        // if (!matcherCtxKey.equals(PublicKey.default)) {
-        //   try {
-        //     if (cancelled) return;
-        //     const ctxInfo = await connection.getAccountInfo(matcherCtxKey, { signal: abortController.signal } as any);
-        //     if (!ctxInfo) {
-        //       throw new Error("Matcher context account not found on-chain. Try creating a new market.");
-        //     }
-        //   } catch (e) {
-        //     if (e instanceof Error && e.message.includes("Matcher context")) throw e;
-        //     if (e instanceof Error && e.name === "AbortError") return;
-        //   }
-        // }
-
         const programId = slabProgramId;
         const slabPk = new PublicKey(slabAddress);
-        const [lpPda, lpBump] = deriveLpPda(programId, slabPk, params.lpIdx);
+        const [lpPda] = deriveLpPda(programId, slabPk, params.lpIdx);
 
-        // Determine if this is an admin-oracle market:
-        // oracleAuthority != default means an admin has been set (regardless of feedId)
-        const hasAdminOracle = !mktConfig.oracleAuthority.equals(PublicKey.default);
+        // Determine oracle mode using centralised detectOracleMode (oraclePrice.ts).
+        // "pyth-pinned" = Pyth feed; "admin" or "hyperp" = use slab as oracle account.
+        const oracleMode = detectOracleMode(mktConfig);
+        const useAdminOracle = oracleMode !== "pyth-pinned";
         const feedHex = Array.from(mktConfig.indexFeedId.toBytes()).map(b => b.toString(16).padStart(2, "0")).join("");
-        const isZeroFeed = feedHex === "0".repeat(64);
-        // Use slab as oracle account when admin oracle is set OR feed is all zeros
-        const useAdminOracle = hasAdminOracle || isZeroFeed;
         const oracleAccount = useAdminOracle ? slabPk : derivePythPushOraclePDA(feedHex)[0];
 
         const instructions = [];
@@ -80,47 +66,7 @@ export function useTrade(slabAddress: string) {
         // fabricated oracle price (e.g. $1) would cause catastrophic mispricing.
         const userIsOracleAuth = useAdminOracle && mktConfig.oracleAuthority.equals(wallet.publicKey);
         if (userIsOracleAuth) {
-          // Fetch the authoritative price from the backend. Fail hard if unavailable.
-          let priceE6: bigint;
-          try {
-            const resp = await fetch(`/api/prices/markets`);
-            if (!resp.ok) throw new Error(`Price fetch failed: HTTP ${resp.status}`);
-            const prices = await resp.json();
-            const entry = prices[slabAddress];
-            if (!entry?.priceE6) throw new Error("No price available for this market from backend");
-            priceE6 = BigInt(entry.priceE6);
-          } catch (fetchErr) {
-            // Do NOT fall back to a hardcoded price — abort to prevent mispricing.
-            throw new Error(
-              `Cannot push oracle price: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}. ` +
-              `Retry when the price service is available.`
-            );
-          }
-          if (priceE6 <= 0n) {
-            throw new Error(`Invalid oracle price: ${priceE6}. Price must be positive. Aborting to prevent mispricing.`);
-          }
-
-          // Use on-chain slot time instead of client Date.now() to avoid clock drift
-          // between client and validator causing signature verification failures
-          let oracleTimestamp: bigint;
-          try {
-            const slot = await connection.getSlot("confirmed");
-            const blockTime = await connection.getBlockTime(slot);
-            oracleTimestamp = BigInt(blockTime ?? Math.floor(Date.now() / 1000));
-          } catch {
-            // Fallback to client time if RPC fails
-            oracleTimestamp = BigInt(Math.floor(Date.now() / 1000));
-          }
-
-          const pushIx = buildIx({
-            programId,
-            keys: buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [wallet.publicKey, slabPk]),
-            data: encodePushOraclePrice({
-              priceE6: priceE6,
-              timestamp: oracleTimestamp,
-            }),
-          });
-          instructions.push(pushIx);
+          throw new Error(INLINE_ORACLE_PUSH_REMOVED_ERROR);
         }
 
         // Always prepend a permissionless crank before trading
@@ -129,23 +75,23 @@ export function useTrade(slabAddress: string) {
         const crankIx = buildIx({
           programId,
           keys: buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [wallet.publicKey, slabPk, WELL_KNOWN.clock, oracleAccount]),
-          data: encodeKeeperCrank({ callerIdx: 65535, allowPanic: false }),
+          data: encodeKeeperCrank({ callerIdx: 65535 }),
         });
         instructions.push(crankIx);
 
-        // PERC-199: clock sysvar removed from TradeCpi — program uses Clock::get() syscall
         const tradeIx = buildIx({
           programId,
           keys: buildAccountMetas(ACCOUNTS_TRADE_CPI, [
             wallet.publicKey,
             lpAccount.account.owner,
             slabPk,
+            WELL_KNOWN.clock,
             oracleAccount,
             lpAccount.account.matcherProgram,
             lpAccount.account.matcherContext,
             lpPda,
           ]),
-          data: encodeTradeCpiV2({ lpIdx: params.lpIdx, userIdx: params.userIdx, size: params.size.toString(), bump: lpBump }),
+          data: encodeTradeCpi({ lpIdx: params.lpIdx, userIdx: params.userIdx, size: params.size.toString(), limitPriceE6: params.limitPriceE6?.toString() ?? "0" }),
         });
         instructions.push(tradeIx);
 

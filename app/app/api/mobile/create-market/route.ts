@@ -40,22 +40,15 @@ import {
   encodeDepositCollateral,
   encodeTopUpInsurance,
   encodeKeeperCrank,
-  encodeSetOracleAuthority,
-  encodePushOraclePrice,
   encodeSetOraclePriceCap,
   encodeUpdateConfig,
-  encodeCreateInsuranceMint,
-  deriveInsuranceLpMint,
   ACCOUNTS_INIT_MARKET,
   ACCOUNTS_INIT_LP,
   ACCOUNTS_DEPOSIT_COLLATERAL,
   ACCOUNTS_TOPUP_INSURANCE,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_SET_ORACLE_AUTHORITY,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   ACCOUNTS_SET_ORACLE_PRICE_CAP,
   ACCOUNTS_UPDATE_CONFIG,
-  ACCOUNTS_CREATE_INSURANCE_MINT,
   buildAccountMetas,
   WELL_KNOWN,
   buildIx,
@@ -63,7 +56,7 @@ import {
   deriveLpPda,
   SLAB_TIERS,
   type SlabTierKey,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { getConfig, getRpcEndpoint } from "@/lib/config";
 import { getClientIp } from "@/lib/get-client-ip";
 import {
@@ -71,6 +64,15 @@ import {
   CREATE_MARKET_RATE_LIMIT,
 } from "@/lib/create-market-rate-limit";
 import * as Sentry from "@sentry/nextjs";
+// TODO(oracle-migration): encodeSetOracleAuthority/encodePushOraclePrice and their
+// account lists were removed in beta.29. Mobile create-market oracle init/push path
+// needs migration to /api/oracle/advance-phase or equivalent server-side crank flow.
+import {
+  encodeSetOracleAuthority,
+  encodePushOraclePrice,
+  ACCOUNTS_SET_ORACLE_AUTHORITY,
+  ACCOUNTS_PUSH_ORACLE_PRICE,
+} from "@/lib/sdk-compat";
 
 /** Minimum token amount for vault seed transfer (matches on-chain guard). */
 const MIN_INIT_MARKET_SEED = 500_000_000n;
@@ -250,8 +252,6 @@ export async function POST(req: NextRequest) {
     const [vaultPda] = deriveVaultAuthority(programId, slabPk);
     const vaultAta = await getAssociatedTokenAddress(mintPk, vaultPda, true);
     const userAta = await getAssociatedTokenAddress(mintPk, deployerPk);
-    const [insLpMint] = deriveInsuranceLpMint(programId, slabPk);
-    const [vaultAuth] = deriveVaultAuthority(programId, slabPk);
 
     // ── Rent ──────────────────────────────────────────────────────────────────
     const [slabRent, matcherCtxRent] = await Promise.all([
@@ -302,13 +302,14 @@ export async function POST(req: NextRequest) {
       tradingFeeBps: "30",
       maxAccounts: maxAccounts.toString(),
       newAccountFee: "1000000",
-      riskReductionThreshold: "0",
       maintenanceFeePerSlot: "0",
       maxCrankStalenessSlots: "400",
       liquidationFeeBps: "100",
       liquidationFeeCap: "100000000000",
-      liquidationBufferBps: "50",
       minLiquidationAbs: "1000000",
+      minInitialDeposit: "1000000",
+      minNonzeroMmReq: "0",
+      minNonzeroImReq: "0",
     });
 
     const initMarketKeys = buildAccountMetas(ACCOUNTS_INIT_MARKET, [
@@ -366,20 +367,12 @@ export async function POST(req: NextRequest) {
     const updateConfigIx = buildIx({
       programId,
       keys: updateConfigKeys,
+      // v12.17: UpdateConfig only accepts 4 funding params
       data: encodeUpdateConfig({
         fundingHorizonSlots: "3600",
         fundingKBps: "100",
-        fundingInvScaleNotionalE6: "1000000000000",
         fundingMaxPremiumBps: "1000",
         fundingMaxBpsPerSlot: "10",
-        threshFloor: "0",
-        threshRiskBps: "500",
-        threshUpdateIntervalSlots: "100",
-        threshStepBps: "100",
-        threshAlphaBps: "5000",
-        threshMin: "0",
-        threshMax: "1000000000000000000",
-        threshMinStep: "0",
       }),
     });
 
@@ -393,7 +386,7 @@ export async function POST(req: NextRequest) {
     const crankIx1 = buildIx({
       programId,
       keys: crankKeys1,
-      data: encodeKeeperCrank({ callerIdx: 65535, allowPanic: false }),
+      data: encodeKeeperCrank({ callerIdx: 65535 }),
     });
 
     const tx1 = new Transaction({ recentBlockhash: blockhash, feePayer: deployerPk });
@@ -411,12 +404,14 @@ export async function POST(req: NextRequest) {
       programId: matcherProgramId,
     });
 
+    // beta.32: ACCOUNTS_INIT_LP expanded to 6 accounts — added clock
     const initLpKeys = buildAccountMetas(ACCOUNTS_INIT_LP, [
       deployerPk,
       slabPk,
       userAta,
       vaultAta,
       WELL_KNOWN.tokenProgram,
+      WELL_KNOWN.clock,
     ]);
     const initLpIx = buildIx({
       programId,
@@ -484,7 +479,7 @@ export async function POST(req: NextRequest) {
     const crankIx3 = buildIx({
       programId,
       keys: crankKeys3,
-      data: encodeKeeperCrank({ callerIdx: 65535, allowPanic: false }),
+      data: encodeKeeperCrank({ callerIdx: 65535 }),
     });
 
     const tx3Instructions = [depositIx, topupIx, pushIx2, crankIx3];
@@ -509,29 +504,8 @@ export async function POST(req: NextRequest) {
     const tx3 = new Transaction({ recentBlockhash: blockhash, feePayer: deployerPk });
     tx3.add(...tx3Instructions);
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // TX 4: CreateInsuranceLpMint — permissionless insurance deposits
-    // Signed by: deployer only
-    // ═══════════════════════════════════════════════════════════════════════════
-    const createMintKeys = buildAccountMetas(ACCOUNTS_CREATE_INSURANCE_MINT, [
-      deployerPk,     // admin (signer)
-      slabPk,          // slab
-      insLpMint,       // ins_lp_mint (PDA, writable)
-      vaultAuth,       // vault_authority
-      mintPk,          // collateral_mint
-      SystemProgram.programId,      // system_program
-      WELL_KNOWN.tokenProgram,      // token_program
-      WELL_KNOWN.rent,              // rent
-      deployerPk,      // payer (signer, writable)
-    ]);
-    const createMintIx = buildIx({
-      programId,
-      keys: createMintKeys,
-      data: encodeCreateInsuranceMint(),
-    });
-
-    const tx4 = new Transaction({ recentBlockhash: blockhash, feePayer: deployerPk });
-    tx4.add(createMintIx);
+    // Insurance LP mint creation removed — moved to percolator-stake program.
+    // Markets are fully operational without it (TX 0-3 are sufficient).
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Response — client signs each tx with MWA, sends in order, then calls
@@ -540,7 +514,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       slab_address: slabPk.toBase58(),
       /** Base64-encoded partially-signed transactions. Mobile adds deployer signature. */
-      unsigned_txs: [tx0, tx1, tx2, tx3, tx4].map(txToBase64),
+      unsigned_txs: [tx0, tx1, tx2, tx3].map(txToBase64),
       /** Config for the POST /api/markets registration call after all txs succeed. */
       registration: {
         slab_address: slabPk.toBase58(),

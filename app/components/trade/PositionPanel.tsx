@@ -1,13 +1,15 @@
 "use client";
 
-import { FC, useMemo, useState, useRef, useEffect } from "react";
+import { FC, useMemo, useState, useRef, useEffect, useCallback } from "react";
 import { useUserAccount } from "@/hooks/useUserAccount";
 import { useMarketConfig } from "@/hooks/useMarketConfig";
 import { useClosePosition } from "@/hooks/useClosePosition";
+import { useDeposit } from "@/hooks/useDeposit";
 import { useEngineState } from "@/hooks/useEngineState";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
-import { AccountKind } from "@percolator/sdk";
+import { useMarketInfo } from "@/hooks/useMarketInfo";
+import { AccountKind } from "@percolatorct/sdk";
 import { formatTokenAmount, formatUsd, formatLiqPrice } from "@/lib/format";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import {
@@ -20,12 +22,154 @@ import { isMockSlab, getMockUserAccount } from "@/lib/mock-trade-data";
 import { WarmupProgress } from "./WarmupProgress";
 import { ClosePositionModal } from "./ClosePositionModal";
 import { sanitizeSymbol } from "@/lib/symbol-utils";
-import { sanitizeFundingRateBps } from "@/lib/health";
+import { sanitizeFundingRateBps, isSentinelValue } from "@/lib/health";
 import { useOracleFreshness } from "@/hooks/useOracleFreshness";
+import { getEntryPrice, getEntryLeverage, clearEntryPrice } from "@/lib/entry-price";
+import { applyInvert, sanitizePriceE6 } from "@/lib/oraclePrice";
+import { getBackendUrl } from "@/lib/config";
+import { parseHumanAmount } from "@/lib/parseAmount";
+import {
+  formatLeverage,
+  ORDER_LEVERAGE_TITLE,
+  RISK_LEVERAGE_LABEL,
+  RISK_LEVERAGE_TITLE,
+} from "@/lib/leverage-display";
 
 function abs(n: bigint): bigint {
   return n < 0n ? -n : n;
 }
+
+// ─── 5.7: ADL rank for this user's position slot ─────────────────────────────
+
+interface AdlRankResult {
+  rank: number | null;      // null = not in rankings (safe)
+  adlNeeded: boolean;
+}
+
+function useAdlRank(slabAddress: string, positionIdx: number | null): AdlRankResult {
+  const [result, setResult] = useState<AdlRankResult>({ rank: null, adlNeeded: false });
+
+  const fetch_ = useCallback(async () => {
+    if (positionIdx === null) return;
+    try {
+      const base = getBackendUrl();
+      const res = await fetch(`${base}/api/adl/rankings?slab=${encodeURIComponent(slabAddress)}`);
+      if (!res.ok) return;
+      const json = await res.json() as {
+        adlNeeded: boolean;
+        rankings: { rank: number; idx: number }[];
+      };
+      const entry = json.rankings.find((r) => r.idx === positionIdx);
+      setResult({ rank: entry?.rank ?? null, adlNeeded: json.adlNeeded });
+    } catch {
+      // non-critical — leave last known value
+    }
+  }, [slabAddress, positionIdx]);
+
+  useEffect(() => {
+    fetch_();
+    const id = setInterval(fetch_, 30_000);
+    return () => clearInterval(id);
+  }, [fetch_]);
+
+  return result;
+}
+
+// ─── 5.9: Add Margin modal ────────────────────────────────────────────────────
+
+interface AddMarginModalProps {
+  slabAddress: string;
+  userIdx: number;
+  symbol: string;
+  decimals: number;
+  onClose: () => void;
+}
+
+const AddMarginModal: FC<AddMarginModalProps> = ({ slabAddress, userIdx, symbol, decimals, onClose }) => {
+  const [amount, setAmount] = useState("");
+  const [lastSig, setLastSig] = useState<string | null>(null);
+  const { deposit, loading, error } = useDeposit(slabAddress);
+
+  let parsedAmount: bigint = 0n;
+  let parseError: string | null = null;
+  if (amount) {
+    try {
+      parsedAmount = parseHumanAmount(amount, decimals);
+    } catch {
+      parseError = `Too many decimal places (max ${decimals})`;
+    }
+  }
+
+  const canSubmit = !loading && amount.length > 0 && !parseError && parsedAmount > 0n;
+
+  async function handleDeposit() {
+    if (!canSubmit) return;
+    try {
+      const sig = await deposit({ userIdx, amount: parsedAmount, accountExists: true });
+      setLastSig(sig ?? null);
+      setAmount("");
+    } catch {
+      // error shown via hook
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="w-full max-w-sm rounded-none border border-[var(--border)]/60 bg-[var(--bg)] p-4 shadow-2xl">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-[11px] font-bold uppercase tracking-[0.15em] text-[var(--text)]">Add Margin</span>
+          <button
+            onClick={onClose}
+            className="text-[var(--text-dim)] hover:text-[var(--text)] transition-colors"
+          >
+            ×
+          </button>
+        </div>
+
+        <p className="mb-3 text-[10px] text-[var(--text-dim)] leading-relaxed">
+          Deposit additional collateral to increase your margin and reduce liquidation risk.
+        </p>
+
+        <div className="mb-2 flex flex-col gap-1">
+          <label className="text-[9px] uppercase tracking-[0.12em] text-[var(--text-dim)]">
+            Amount ({symbol})
+          </label>
+          <input
+            type="text"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+            placeholder={`0.00 ${symbol}`}
+            style={{ fontFamily: "var(--font-mono)" }}
+            className="w-full rounded-none border border-[var(--border)]/50 bg-[var(--bg)] px-3 py-2 text-sm text-[var(--text)] placeholder-[var(--text-muted)] focus:border-[var(--accent)]/40 focus:outline-none focus:ring-1 focus:ring-[var(--accent)]/20"
+          />
+          {parseError && (
+            <p className="text-[10px] text-[var(--short)]">{parseError}</p>
+          )}
+        </div>
+
+        <button
+          onClick={handleDeposit}
+          disabled={!canSubmit}
+          className="w-full rounded-none bg-[var(--accent)] py-2 text-[10px] font-medium uppercase tracking-[0.1em] text-white transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loading ? "Depositing…" : "Deposit Margin"}
+        </button>
+
+        {error && (
+          <p className="mt-2 text-[10px] text-[var(--short)]">{error}</p>
+        )}
+        {lastSig && (
+          <p className="mt-2 text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
+            Tx: {lastSig.slice(0, 16)}…
+          </p>
+        )}
+      </div>
+    </div>
+  );
+};
 
 /** Format seconds into "Xh Ym" countdown string. */
 function formatCountdown(seconds: number): string {
@@ -46,16 +190,23 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const { priceE6: livePriceE6, priceUsd } = useLivePrice();
   const tokenMeta = useTokenMeta(mktConfig?.collateralMint ?? null);
   const mintAddress = mktConfig?.collateralMint?.toBase58() ?? "";
-  const symbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
+  const collateralSymbol = sanitizeSymbol(tokenMeta?.symbol, mintAddress);
+  const { market: marketInfo } = useMarketInfo(slabAddress);
+  const symbol = marketInfo?.symbol ?? collateralSymbol;
   const decimals = tokenMeta?.decimals ?? 6;
 
   const { closePosition, loading: closeLoading, error: closeError } = useClosePosition(slabAddress);
   const [showCloseModal, setShowCloseModal] = useState(false);
+  const [showAddMarginModal, setShowAddMarginModal] = useState(false);
 
   // GH#1842: Oracle staleness check — mirrors TradeForm guard
   const { level: oracleLevel, mode: oracleMode, ready: oracleReady } = useOracleFreshness();
   const oracleUnavailable = oracleLevel === "unavailable";
   const oracleStale = !mockMode && (oracleUnavailable || (oracleReady && oracleLevel === "stale" && (oracleMode === "admin" || oracleMode === "hyperp")));
+
+  // 5.7: ADL rank — fetch once account is known; positionIdx = userAccount.idx
+  const adlPositionIdx = userAccount ? userAccount.idx : null;
+  const { rank: adlRank, adlNeeded } = useAdlRank(slabAddress, adlPositionIdx);
 
   // 3.2: PnL flash on sign change
   const [pnlFlash, setPnlFlash] = useState<"long" | "short" | null>(null);
@@ -92,20 +243,29 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const hasPosition = account.positionSize !== 0n;
   const isLong = account.positionSize > 0n;
   const absPosition = abs(account.positionSize);
-  const onChainPriceE6 = config?.lastEffectivePriceE6 ?? null;
+  // Apply invert + sanitize on the on-chain fallback so an inverted market
+  // doesn't show the reciprocal price during WS reconnects (~$0.0000067 vs $150).
+  const onChainPriceE6 = config
+    ? sanitizePriceE6(applyInvert(config.lastEffectivePriceE6, config.invert))
+    : null;
   const currentPriceE6 = livePriceE6 ?? onChainPriceE6 ?? 0n;
 
-  const entryPriceE6 = account.entryPrice;
+  // V12_1: entry_price removed from on-chain struct. Fall back to saved entry price.
+  const rawEntryPrice = account.entryPrice;
+  const savedEntryPrice = rawEntryPrice > 0n ? 0n : getEntryPrice(slabAddress, userAccount.idx);
+  const resolvedEntryPrice = rawEntryPrice > 0n ? rawEntryPrice : (savedEntryPrice > 0n ? savedEntryPrice : 0n);
+  const entryPriceE6 = resolvedEntryPrice > 0n ? resolvedEntryPrice : currentPriceE6;
 
   // PERC-297: Mark price is considered "available" when it's a positive value.
   const hasValidMark = currentPriceE6 > 0n;
 
-  // Bug fix: Don't compute P&L with stale/zero price to avoid flash
-  const pnlTokens = hasValidMark ? computeMarkPnl(
-    account.positionSize,
-    account.entryPrice,
-    currentPriceE6,
-  ) : 0n;
+  // PnL: prefer mark-to-market from entry price (on-chain or saved),
+  // fall back to on-chain realized PnL if neither is available.
+  const pnlTokens = hasValidMark
+    ? (resolvedEntryPrice > 0n
+        ? computeMarkPnl(account.positionSize, resolvedEntryPrice, currentPriceE6)
+        : (isSentinelValue(account.pnl) ? 0n : account.pnl))
+    : 0n;
   const pnlUsdRaw =
     priceUsd !== null && hasValidMark ? (Number(pnlTokens) / 10 ** decimals) * priceUsd : null;
   const pnlUsd = pnlUsdRaw !== null && Number.isFinite(pnlUsdRaw) ? pnlUsdRaw : null;
@@ -144,14 +304,22 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
 
   const pnlBarWidth = Math.min(100, Math.max(0, Math.abs(roe)));
 
-  // 3.1: Leverage = position notional / capital (both in same token units for stablecoin perps)
-  const leverage = hasPosition && account.capital > 0n
-    ? Math.round(Number(absPosition) / Number(account.capital))
-    : 1;
+  // 3.1: Leverage = notional / capital. Notional = contracts × markPrice / 1e6.
+  // Old formula used raw contract count which gives ~0 for coin-margined positions.
+  const notionalE6 = absPosition * currentPriceE6;
+  const accountLeverage = hasPosition && account.capital > 0n && currentPriceE6 > 0n
+    ? Number(notionalE6 / 1_000_000n) / Number(account.capital)
+    : 0;
+  const savedOrderLeverage = getEntryLeverage(slabAddress, userAccount.idx);
+  const displayLeverage = savedOrderLeverage ?? accountLeverage;
+  const displayLeverageKind = savedOrderLeverage != null ? "Order" : "Risk";
+  const leverageTitle = savedOrderLeverage != null
+    ? `${ORDER_LEVERAGE_TITLE} ${RISK_LEVERAGE_LABEL} is ${formatLeverage(accountLeverage)} because all collateral in this slab account backs liquidation.`
+    : RISK_LEVERAGE_TITLE;
 
   let marginHealthStr = "N/A";
-  if (hasPosition && absPosition > 0n) {
-    const healthPct = Number((account.capital * 100n) / absPosition);
+  if (hasPosition && notionalE6 > 0n) {
+    const healthPct = Number(account.capital * 1_000_000n * 100n / notionalE6);
     marginHealthStr = `${healthPct.toFixed(1)}%`;
   }
 
@@ -214,6 +382,7 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
   const handleConfirmClose = async (percent: number) => {
     try {
       await closePosition(percent);
+      if (percent === 100 && userAccount) clearEntryPrice(slabAddress, userAccount.idx);
       setShowCloseModal(false);
     } catch {
       // error shown via hook state
@@ -266,9 +435,14 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
               {symbol}/USD
             </span>
             {/* Leverage badge */}
-            <span className="text-[8px] bg-[var(--accent)]/10 text-[var(--accent)] px-1 py-0.5">
-              {leverage}x
+            <span
+              className="text-[8px] bg-[var(--accent)]/10 text-[var(--accent)] px-1 py-0.5"
+              title={leverageTitle}
+            >
+              {displayLeverageKind} {formatLeverage(displayLeverage)}
             </span>
+            {/* 5.7: ADL rank indicator */}
+            <AdlRankBadge rank={adlRank} adlNeeded={adlNeeded} />
             {/* Spacer + CLOSE button */}
             <div className="flex-1" />
             <button
@@ -308,11 +482,19 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
 
             {/* Position details — spreadsheet rows */}
             <div className="divide-y divide-[var(--border)]/30">
+              {/* 5.8: Dual contract+USD size */}
               <div className="flex items-center justify-between py-1.5">
                 <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Size</span>
-                <span className="text-[11px] text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>
-                  {formatTokenAmount(absPosition, decimals)} {symbol}
-                </span>
+                <div className="flex flex-col items-end gap-0.5">
+                  <span className="text-[11px] text-[var(--text)]" style={{ fontFamily: "var(--font-mono)" }}>
+                    {formatTokenAmount(absPosition, decimals)} {symbol}
+                  </span>
+                  {priceUsd != null && priceUsd > 0 && (
+                    <span className="text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
+                      ${(Number(absPosition) / 10 ** decimals * priceUsd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  )}
+                </div>
               </div>
               <div className="flex items-center justify-between py-1.5">
                 <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Entry Price</span>
@@ -353,6 +535,24 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
                 </span>
               </div>
               <div className="flex items-center justify-between py-1.5">
+                <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]" title={RISK_LEVERAGE_TITLE}>
+                  {RISK_LEVERAGE_LABEL}
+                </span>
+                <span className="text-[11px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-mono)" }}>
+                  {formatLeverage(accountLeverage)}
+                </span>
+              </div>
+              {savedOrderLeverage != null && (
+                <div className="flex items-center justify-between py-1.5">
+                  <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]" title={ORDER_LEVERAGE_TITLE}>
+                    Order Lev.
+                  </span>
+                  <span className="text-[11px] text-[var(--text-secondary)]" style={{ fontFamily: "var(--font-mono)" }}>
+                    {formatLeverage(savedOrderLeverage)}
+                  </span>
+                </div>
+              )}
+              <div className="flex items-center justify-between py-1.5">
                 <span className="text-[10px] uppercase tracking-[0.15em] text-[var(--text-dim)]">Est. Funding (24h)</span>
                 <span className={`text-[11px] font-medium ${estFundingColor}`} style={{ fontFamily: "var(--font-mono)" }}>
                   {estFunding24hDisplay}
@@ -379,15 +579,23 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
               </div>
             )}
 
-            {/* Full close button (below the × in header) */}
-            <button
-              onClick={() => setShowCloseModal(true)}
-              disabled={closeLoading || lpUnderfunded || !hasValidMark}
-              title={!hasValidMark ? "Waiting for price data…" : undefined}
-              className="mt-2 w-full rounded-none border border-[var(--short)]/30 py-2 text-[10px] font-medium uppercase tracking-[0.1em] text-[var(--short)] transition-all duration-150 hover:bg-[var(--short)]/8 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {!hasValidMark ? "Awaiting Price…" : "Close Position"}
-            </button>
+            {/* 5.9: Add Margin + Close buttons */}
+            <div className="mt-2 flex gap-1.5">
+              <button
+                onClick={() => setShowAddMarginModal(true)}
+                className="flex-1 rounded-none border border-[var(--accent)]/30 py-2 text-[10px] font-medium uppercase tracking-[0.1em] text-[var(--accent)] transition-all duration-150 hover:bg-[var(--accent)]/8"
+              >
+                + Margin
+              </button>
+              <button
+                onClick={() => setShowCloseModal(true)}
+                disabled={closeLoading || lpUnderfunded || !hasValidMark}
+                title={!hasValidMark ? "Waiting for price data…" : undefined}
+                className="flex-1 rounded-none border border-[var(--short)]/30 py-2 text-[10px] font-medium uppercase tracking-[0.1em] text-[var(--short)] transition-all duration-150 hover:bg-[var(--short)]/8 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {!hasValidMark ? "Awaiting Price…" : "Close Position"}
+              </button>
+            </div>
 
             {closeError && (
               <div className="mt-2 rounded-none border border-[var(--short)]/20 bg-[var(--short)]/5 px-3 py-2">
@@ -406,6 +614,7 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           currentPrice={currentPriceE6}
           capital={account.capital}
           symbol={symbol}
+          collateralSymbol={collateralSymbol}
           decimals={decimals}
           priceUsd={priceUsd}
           isLong={isLong}
@@ -415,9 +624,59 @@ export const PositionPanel: FC<{ slabAddress: string }> = ({ slabAddress }) => {
           onCancel={() => setShowCloseModal(false)}
         />
       )}
+
+      {/* 5.9: Add Margin Modal */}
+      {showAddMarginModal && hasPosition && (
+        <AddMarginModal
+          slabAddress={slabAddress}
+          userIdx={userAccount.idx}
+          symbol={symbol}
+          decimals={decimals}
+          onClose={() => setShowAddMarginModal(false)}
+        />
+      )}
     </div>
   );
 };
+
+// ─── 5.7: ADL rank badge ──────────────────────────────────────────────────────
+
+function AdlRankBadge({ rank, adlNeeded }: { rank: number | null; adlNeeded: boolean }) {
+  if (!adlNeeded && rank === null) return null;
+
+  // Color: rank <= 3 is high risk (red), rank <= 10 yellow, rest green
+  const color =
+    rank !== null && rank <= 3
+      ? "bg-[var(--short)] border-[var(--short)]/50 text-white"
+      : rank !== null && rank <= 10
+        ? "bg-[var(--warning)] border-[var(--warning)]/50 text-[var(--bg)]"
+        : "bg-[var(--long)] border-[var(--long)]/50 text-white";
+
+  const label =
+    rank !== null
+      ? `ADL #${rank}`
+      : adlNeeded
+        ? "ADL Safe"
+        : null;
+
+  if (!label) return null;
+
+  const tooltip =
+    rank !== null && rank <= 3
+      ? "High ADL risk — position may be auto-deleveraged soon"
+      : rank !== null && rank <= 10
+        ? "Moderate ADL risk — monitor insurance fund utilization"
+        : "ADL active but your position is relatively safe";
+
+  return (
+    <span
+      title={tooltip}
+      className={`inline-flex items-center gap-0.5 rounded-none border px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-[0.06em] ${color}`}
+    >
+      {label}
+    </span>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 3.2 + 3.3: PnL section — extracted to use hooks cleanly

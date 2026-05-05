@@ -1,20 +1,54 @@
 "use client";
 
-import { FC, useState, useRef, useEffect, useCallback } from "react";
-import { createChart, IChartApi, ISeriesApi, LineStyle, ColorType, CrosshairMode } from "lightweight-charts";
+import { FC, useState, useRef, useEffect, useCallback, useMemo } from "react";
+import {
+  createChart,
+  IChartApi,
+  ISeriesApi,
+  LineStyle,
+  ColorType,
+  CrosshairMode,
+  CandlestickSeries,
+  HistogramSeries,
+  BarSeries,
+  LineSeries,
+  AreaSeries,
+} from "lightweight-charts";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { useLivePrice } from "@/hooks/useLivePrice";
 import { useTokenChart } from "@/hooks/useTokenChart";
+import { usePythChart } from "@/hooks/usePythChart";
+import { usePercolatorCandles } from "@/hooks/usePercolatorCandles";
 import { useUserAccount } from "@/hooks/useUserAccount";
 import { useMarketConfig } from "@/hooks/useMarketConfig";
+import { useMarketInfo } from "@/hooks/useMarketInfo";
 import { useEngineState } from "@/hooks/useEngineState";
 import { useLiqPrice } from "@/hooks/useLiqPrice";
 import { useChartTheme } from "@/hooks/useChartTheme";
 import { ChartEmptyState } from "./ChartEmptyState";
+import { ChartStyleMenu } from "./ChartStyleMenu";
+import { ChartDisplayMenu } from "./ChartDisplayMenu";
+import { ChartPnlBadge } from "./ChartPnlBadge";
+import { computeRef24h, computePriceChange } from "@/lib/chart-stats";
 import { isMockMode } from "@/lib/mock-mode";
 import { isMockSlab, getMockUserAccount } from "@/lib/mock-trade-data";
+import { getEntryPrice } from "@/lib/entry-price";
+import { useChartStylePref } from "@/hooks/useChartStylePref";
+import { useChartOverlayPrefs } from "@/hooks/useChartOverlayPrefs";
+import { useChartIndicatorPrefs } from "@/hooks/useChartIndicatorPrefs";
+import { isOverlayKind, isPaneKind } from "@/lib/indicator-registry";
+import { useIndicatorOverlays } from "./useIndicatorOverlays";
+import { useIndicatorOscillatorPane } from "./useIndicatorOscillatorPane";
+import { ChartIndicatorMenu } from "./ChartIndicatorMenu";
+import {
+  isCandleStyle,
+  candleStyleOptions,
+  chartDataKind,
+  hasRenderableData,
+  type ChartSeriesKind,
+} from "@/lib/chart-style";
+import { assertNever } from "@/lib/exhaustive";
 
-type ChartType = "line" | "candle";
 // Phase 2: added 15m timeframe
 type Timeframe = "1m" | "5m" | "15m" | "1h" | "4h" | "1d" | "7d" | "30d";
 
@@ -93,6 +127,21 @@ function PositionSummary({ slabAddress }: PositionSummaryProps) {
   );
 }
 
+/**
+ * Map a market's underlying-asset symbol to the Pyth Benchmarks feed symbol.
+ * Pyth feeds follow `Crypto.<ASSET>/USD` naming. Keep the list tight — the
+ * server-side API route has the same allowlist and will reject anything not
+ * on it. Extending the allowlist means updating BOTH here and
+ * `/api/chart/pyth/route.ts`.
+ */
+function pythSymbolForAsset(assetSymbol: string | null | undefined): string | null {
+  if (!assetSymbol) return null;
+  const s = assetSymbol.trim().toUpperCase();
+  if (!s) return null;
+  const supported = new Set(["SOL", "BTC", "ETH", "JUP", "JTO", "WIF", "BONK", "PYTH"]);
+  return supported.has(s) ? `Crypto.${s}/USD` : null;
+}
+
 export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = ({
   slabAddress,
   mintAddress,
@@ -100,9 +149,23 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
   const { config } = useSlabState();
   const { priceUsd } = useLivePrice();
   const chartTheme = useChartTheme();
-  const [chartType, setChartType] = useState<ChartType>("candle");
+  const [chartStyle, setChartStyle] = useChartStylePref();
+  const [overlayPrefs, setOverlayPref] = useChartOverlayPrefs();
+  const {
+    indicators,
+    addIndicator,
+    removeIndicator,
+    updateIndicator,
+    clearAll: clearAllIndicators,
+  } = useChartIndicatorPrefs(slabAddress);
   const [timeframe, setTimeframe] = useState<Timeframe>("1d");
   const [oraclePrices, setOraclePrices] = useState<PricePoint[]>([]);
+
+  // Resolve the Pyth Benchmarks feed for this market. For SOL/USDC perp the
+  // underlying is SOL → `Crypto.SOL/USD`. Non-mapped assets fall through to
+  // the GeckoTerminal pool-history path and then to oracle aggregation.
+  const marketInfoForSymbol = useMarketInfo(slabAddress);
+  const pythSymbol = pythSymbolForAsset(marketInfoForSymbol.market?.symbol);
 
   // Phase 2: liq price overlay
   const realUserAccount = useUserAccount();
@@ -112,19 +175,100 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<"Candlestick" | "Line"> | null>(null);
+  // Flips true once the chart-init effect has populated chartRef.current,
+  // back to false on unmount. Provides a reactive trigger for downstream
+  // hooks (useIndicatorOverlays) that need to attach series to the chart
+  // — refs alone can't drive an effect since they don't trigger re-runs.
+  const [chartReady, setChartReady] = useState(false);
+  const seriesRef = useRef<ISeriesApi<ChartSeriesKind> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLineRef = useRef<ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]> | null>(null);
   const liqLineRef = useRef<ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]> | null>(null);
   const entryLineRef = useRef<ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]> | null>(null);
+  // Track whether we've done the initial viewport fit for the current
+  // timeframe/chart-type/data-source. Without this, calling fitContent() on
+  // every poll (new bar arrives every ~30s for Pyth / 60s for GeckoTerminal)
+  // wipes out any user pan/zoom — the chart snaps back to "all bars visible"
+  // and the user can't stay zoomed in.
+  const fitKeyRef = useRef<string>("");
 
+  // Crosshair-hover OHLCV readout. Populated via chart.subscribeCrosshairMove;
+  // rendered as a floating tooltip overlay inside the chart container.
+  const [hoverBar, setHoverBar] = useState<{
+    time: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    isCandle: boolean;
+  } | null>(null);
+
+  // Prefer Pyth Benchmarks (canonical global spot price; deep history) when
+  // the market's underlying asset has a Pyth feed. Same data source Hyperliquid
+  // / Drift / Jupiter Perps use — shows real SOL/USD history back days/years,
+  // not just the last 24 h of our keeper observations.
+  const {
+    candles: pythCandles,
+    status: pythStatus,
+  } = usePythChart(pythSymbol, timeframe);
+
+  // Fallback source: GeckoTerminal via the mint's DEX pool. Used when no Pyth
+  // feed is mapped for this asset (e.g. long-tail tokens).
   const {
     candles: externalCandles,
     status: externalStatus,
     poolAddress,
   } = useTokenChart(mintAddress ?? null, timeframe);
 
-  const hasExternalData = externalStatus === "success" && externalCandles.length > 0;
+  // Tier-0: Percolator's own internal-trade candles. Preferred when the slab
+  // has active match-engine volume, because these reflect OUR fills rather
+  // than Pyth's spot tape — and update live via the trades:<slab> WS channel.
+  const {
+    candles: percolatorCandlesRaw,
+    status: percolatorStatus,
+  } = usePercolatorCandles(slabAddress ?? null, timeframe);
+
+  // Convert from {time: unix-seconds} to {timestamp: ms} shape used by the chart.
+  // Memoed so identity is stable between renders that don't change the source
+  // array — without this, every parent render (live-price tick, crosshair
+  // hover, etc.) produces a fresh array, which cascades into candleData →
+  // indicator hooks → full series remove+recreate at WS cadence.
+  const percolatorCandles = useMemo(
+    () => percolatorCandlesRaw.map((c) => ({
+      timestamp: c.time * 1000,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+    })),
+    [percolatorCandlesRaw],
+  );
+
+  // Prefer Percolator as the chart source only when it has enough coverage to
+  // form a readable chart. With 1–2 candles against a 24 h window, the tier-0
+  // source produces a mostly-empty chart that looks broken — Pyth's deep spot
+  // history is a better background until real internal volume arrives.
+  //
+  // The user's fill is still visible: the Entry price line renders on top of
+  // whichever source is showing, so a new trader sees their entry against
+  // Pyth's SOL/USD context before Percolator has enough bars to stand alone.
+  //
+  // Two exceptions where Percolator still wins below the threshold: (a) Pyth
+  // returned no data for this asset (long-tail token), or (b) Pyth errored.
+  // In either case "any Percolator data" is strictly better than nothing.
+  const MIN_PERC_BARS = 10;
+  const percHasEnough =
+    percolatorStatus === "success" && percolatorCandles.length >= MIN_PERC_BARS;
+  const pythHasNothing =
+    (pythStatus === "success" && pythCandles.length === 0) || pythStatus === "error";
+  const hasPercolatorData =
+    percolatorStatus === "success" &&
+    percolatorCandles.length > 0 &&
+    (percHasEnough || pythHasNothing);
+  const hasPythData = !hasPercolatorData && pythStatus === "success" && pythCandles.length > 0;
+  const hasExternalData = !hasPercolatorData && !hasPythData && externalStatus === "success" && externalCandles.length > 0;
 
   // Fetch oracle price history
   useEffect(() => {
@@ -135,6 +279,9 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
           timestamp: pricePointTimestampToMs(p.timestamp),
           price: parseInt(p.price_e6) / 1e6,
         }));
+        // lightweight-charts requires strictly ascending timestamps; sort defensively
+        // in case the API returns prices in an unexpected order.
+        apiPrices.sort((a: PricePoint, b: PricePoint) => a.timestamp - b.timestamp);
         setOraclePrices(apiPrices);
       })
       .catch(() => {});
@@ -151,31 +298,69 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
     });
   }, [config, priceUsd]);
 
-  // Derive data
-  const oracleFiltered = (() => {
-    const cutoff = Date.now() - TIMEFRAME_MS[timeframe];
-    return oraclePrices.filter((p) => p.timestamp >= cutoff);
-  })();
+  // Derive data. Memoed because oraclePrices only changes on the 5s-gated
+  // live-price effect (line ~287), so the filtered slice is reference-stable
+  // between most renders. Same WS-tick churn argument as percolatorCandles
+  // above — without this, candleData's memo invalidates on every tick.
+  const oracleFiltered = useMemo(
+    () => {
+      const cutoff = Date.now() - TIMEFRAME_MS[timeframe];
+      return oraclePrices.filter((p) => p.timestamp >= cutoff);
+    },
+    [oraclePrices, timeframe],
+  );
 
-  const candleData = (() => {
+  // Data source priority: Percolator internal trades (tier-0, when >=10 bars) →
+  // Pyth Benchmarks (canonical spot) → GeckoTerminal (DEX-pool history for
+  // long-tail tokens) → oracle-aggregated fallback (keeper observations).
+  //
+  // Memoed so the reference is stable between renders that don't change the
+  // underlying source arrays. Without this, every parent render (e.g. on
+  // unrelated state like timeframe-pill hover) creates a new array, which
+  // re-fires the indicator hooks' effects and tears down + reallocates the
+  // oscillator pane on every WebSocket tick.
+  const candleData = useMemo(() => {
+    if (hasPercolatorData) return percolatorCandles;
+    if (hasPythData) return pythCandles as { timestamp: number; open: number; high: number; low: number; close: number; volume: number }[];
     if (hasExternalData) return externalCandles as { timestamp: number; open: number; high: number; low: number; close: number; volume: number }[];
     return aggregateCandles(oracleFiltered, CANDLE_INTERVAL_MS);
-  })();
+  }, [hasPercolatorData, hasPythData, hasExternalData, percolatorCandles, pythCandles, externalCandles, oracleFiltered]);
 
-  const lineData = (() => {
+  const lineData = useMemo(() => {
+    if (hasPercolatorData) return percolatorCandles.map((c) => ({ timestamp: c.timestamp, price: c.close }));
+    if (hasPythData) return pythCandles.map((c) => ({ timestamp: c.timestamp, price: c.close }));
     if (hasExternalData) return externalCandles.map((c) => ({ timestamp: c.timestamp, price: c.close }));
     return oracleFiltered;
-  })();
+  }, [hasPercolatorData, hasPythData, hasExternalData, percolatorCandles, pythCandles, externalCandles, oracleFiltered]);
 
   const totalDataPoints = candleData.length + lineData.length;
 
-  // GH#1625: sparse-data guard
-  const effectiveSparse =
-    (chartType === "candle" && candleData.length < 2) ||
-    (chartType === "line" && lineData.length < 2);
+  // GH#1625: sparse-data guard. Routes through the SoT helper so area and
+  // bar correctly trigger the overlay too — they used to fall through the
+  // ad-hoc candle+line predicate.
+  const { sparse: effectiveSparse } = hasRenderableData(chartStyle, candleData, lineData);
 
   // Phase 2: volume has data (used to show empty state in volume pane)
   const hasVolumeData = candleData.some((c) => (c.volume ?? 0) > 0);
+
+  // Indicator overlays (SMA / EMA / Bollinger). Memo the filtered subset so
+  // the overlay hook's effect only re-runs when the user actually adds /
+  // removes / edits an indicator — not on every WebSocket price tick (which
+  // would churn series remove+recreate at 250ms cadence).
+  const overlayIndicatorConfigs = useMemo(
+    () => indicators.filter((i) => isOverlayKind(i.kind)),
+    [indicators],
+  );
+  useIndicatorOverlays(chartRef, chartReady, candleData, overlayIndicatorConfigs);
+
+  // Oscillator-pane indicators (RSI / MACD). Same memo discipline. The pane
+  // is allocated lazily inside the hook — empty pane configs collapses the
+  // pane and the chart fills the reclaimed vertical space.
+  const paneIndicatorConfigs = useMemo(
+    () => indicators.filter((i) => isPaneKind(i.kind)),
+    [indicators],
+  );
+  useIndicatorOscillatorPane(chartRef, chartReady, candleData, paneIndicatorConfigs, chartTheme);
 
   // Create/destroy chart
   useEffect(() => {
@@ -192,13 +377,45 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
         horzLines: { color: chartTheme.gridColor },
       },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: chartTheme.borderColor },
-      timeScale: { borderColor: chartTheme.borderColor, timeVisible: true, secondsVisible: false },
+      rightPriceScale: {
+        borderColor: chartTheme.borderColor,
+        // Leave a sliver of headroom/footroom so price labels don't clip
+        // against the top/bottom edge of the canvas.
+        scaleMargins: { top: 0.08, bottom: 0.12 },
+      },
+      timeScale: {
+        borderColor: chartTheme.borderColor,
+        timeVisible: true,
+        secondsVisible: false,
+        // rightOffset reserves space to the right of the last bar so the
+        // crosshair can hover past the last candle without getting clipped,
+        // matching TradingView/Binance behaviour.
+        rightOffset: 8,
+        barSpacing: 8,
+        // Keep visual consistency; don't let the user drag past the start.
+        fixLeftEdge: false,
+        fixRightEdge: false,
+      },
+      // Scroll + scale handles default to true but make the intent explicit
+      // so any future refactor doesn't silently disable pan/zoom.
+      handleScroll: {
+        mouseWheel: true,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: true,
+      },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel: true,
+        pinch: true,
+      },
     });
 
     chartRef.current = chart;
+    setChartReady(true);
 
     return () => {
+      setChartReady(false);
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -233,11 +450,13 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
     const ua = realUserAccount;
     if (!ua) return null;
     const ep = ua.account.entryPrice;
-    if (ep == null || ep === 0n) return null;
-    return Number(ep) / 1e6;
+    const resolvedEntryPrice =
+      ep != null && ep > 0n ? ep : getEntryPrice(slabAddress, ua.idx);
+    if (resolvedEntryPrice <= 0n) return null;
+    return Number(resolvedEntryPrice) / 1e6;
   })();
 
-  // Update series when data or chartType changes
+  // Update series when data or chartStyle changes
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
@@ -255,50 +474,24 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
     liqLineRef.current = null;
     entryLineRef.current = null;
 
-    if (chartType === "candle" && candleData.length > 0) {
-      const series = chart.addCandlestickSeries({
-        upColor: chartTheme.upColor,
-        downColor: chartTheme.downColor,
-        borderDownColor: chartTheme.downColor,
-        borderUpColor: chartTheme.upColor,
-        wickDownColor: chartTheme.downColor,
-        wickUpColor: chartTheme.upColor,
-      });
-
-      const formatted = candleData.map((c) => ({
-        time: (Math.floor(c.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-      }));
-      series.setData(formatted);
-      seriesRef.current = series;
-
-      // Phase 2: Volume histogram — always add series; use sentinel 0.001 when
-      // no real volume data exists so the pane renders (showing the "no data" label
-      // via the overlay div below, not via lwc itself).
-      const volumeSeries = chart.addHistogramSeries({
-        priceFormat: { type: "volume" },
-        priceScaleId: "volume",
-      });
-      chart.priceScale("volume").applyOptions({
-        // Phase 2: increase top margin so volume pane is visually taller and
-        // clearly visible even at desktop 1440px. Was 0.85 — now 0.80 (20% height).
-        scaleMargins: { top: 0.80, bottom: 0 },
-      });
-      const volumeData = candleData.map((c) => ({
-        time: (Math.floor(c.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
-        // Phase 2: use a tiny sentinel value so lwc renders the pane even when vol=0
-        value: (c.volume ?? 0) > 0 ? c.volume : 0.001,
-        color: c.close >= c.open ? chartTheme.volUpColor : chartTheme.volDownColor,
-      }));
-      volumeSeries.setData(volumeData);
-      volumeSeriesRef.current = volumeSeries;
-
+    // Series selection.
+    //
+    // The switch is exhaustive over ChartStyle: a future variant added to
+    // ALL_STYLES without a matching case here fails the build at the
+    // assertNever default rather than silently rendering nothing.
+    //
+    // All four candle variants share one fall-through body — they all use
+    // addCandlestickSeries with different colour presets via candleStyleOptions.
+    // Bar series also reads OHLC candleData; line and area both read the
+    // single-value lineData stream.
+    //
+    // Overlay lines (Mark / Liq / Entry) are added per series via the local
+    // addOverlayLines() helper to keep each case body small. They use the
+    // generic ISeriesApi.createPriceLine API which all series types support.
+    const addOverlayLines = (s: ISeriesApi<ChartSeriesKind>) => {
       // Mark price line
       if (priceUsd != null) {
-        priceLineRef.current = series.createPriceLine({
+        priceLineRef.current = s.createPriceLine({
           price: priceUsd,
           color: "rgba(255,255,255,0.6)",
           lineWidth: 1,
@@ -307,11 +500,10 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
           title: "Mark",
         });
       }
-
-      // Phase 2: Liq price overlay
+      // Liq price overlay
       const liqPriceNum = liqPriceE6 != null && liqPriceE6 > 0n ? Number(liqPriceE6) / 1e6 : null;
-      if (liqPriceNum != null && liqPriceNum > 0) {
-        liqLineRef.current = series.createPriceLine({
+      if (overlayPrefs.liq && liqPriceNum != null && liqPriceNum > 0) {
+        liqLineRef.current = s.createPriceLine({
           price: liqPriceNum,
           color: "#ef4444",
           lineWidth: 2,
@@ -320,10 +512,9 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
           title: "Liq",
         });
       }
-
       // Entry price overlay — cyan dashed when position is open
-      if (entryPriceNum != null && entryPriceNum > 0) {
-        entryLineRef.current = series.createPriceLine({
+      if (overlayPrefs.entry && entryPriceNum != null && entryPriceNum > 0) {
+        entryLineRef.current = s.createPriceLine({
           price: entryPriceNum,
           color: "#22d3ee",
           lineWidth: 1,
@@ -332,58 +523,193 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
           title: "Entry",
         });
       }
-    } else if (chartType === "line" && lineData.length > 0) {
-      const series = chart.addLineSeries({
-        color: chartTheme.upColor,
-        lineWidth: 2,
-      });
-      const formatted = lineData.map((p) => ({
-        time: (Math.floor(p.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
-        value: p.price,
-      }));
-      series.setData(formatted);
-      seriesRef.current = series as ISeriesApi<"Candlestick" | "Line">;
+    };
 
-      // Mark price line on line series
-      if (priceUsd != null) {
-        priceLineRef.current = series.createPriceLine({
-          price: priceUsd,
-          color: "rgba(255,255,255,0.6)",
-          lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: "Mark",
+    switch (chartStyle) {
+      case "candle-solid":
+      case "candle-hollow":
+      case "candle-hollow-up":
+      case "candle-hollow-down": {
+        if (!hasRenderableData(chartStyle, candleData, lineData).ready) break;
+        const series = chart.addSeries(CandlestickSeries, {
+          ...candleStyleOptions(chartStyle, chartTheme.upColor, chartTheme.downColor),
+          // Suppress lightweight-charts' built-in last-price label + horizontal
+          // price line. Those show the DEX pool's last candle close (e.g. 84.20)
+          // which is NOT our mark price (84.33) — users saw two prices on the
+          // chart and couldn't tell which was authoritative. Our explicit
+          // createPriceLine below draws the mark price as the only price label.
+          lastValueVisible: false,
+          priceLineVisible: false,
         });
-      }
 
-      // Liq price on line chart
-      const liqPriceNum = liqPriceE6 != null && liqPriceE6 > 0n ? Number(liqPriceE6) / 1e6 : null;
-      if (liqPriceNum != null && liqPriceNum > 0) {
-        liqLineRef.current = series.createPriceLine({
-          price: liqPriceNum,
-          color: "#ef4444",
+        const formatted = candleData.map((c) => ({
+          time: (Math.floor(c.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        }));
+        series.setData(formatted);
+        seriesRef.current = series;
+
+        // Volume histogram — only render when the active data source has real
+        // trade volume. Pyth Benchmarks returns v=0 for every bar (it's a price
+        // feed, not a trade tape); painting a sentinel 0.001 for every bar made
+        // the pane render as a meaningless flat red/green band auto-scaled to
+        // fill the full pane. Hide the series entirely in that case and let the
+        // candles reclaim the bottom 10% of vertical space instead.
+        if (hasVolumeData) {
+          const volumeSeries = chart.addSeries(HistogramSeries, {
+            priceFormat: { type: "volume" },
+            priceScaleId: "volume",
+          });
+          chart.priceScale("volume").applyOptions({
+            scaleMargins: { top: 0.90, bottom: 0 },
+          });
+          const volumeData = candleData.map((c) => ({
+            time: (Math.floor(c.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
+            value: c.volume ?? 0,
+            color: c.close >= c.open ? chartTheme.volUpColor : chartTheme.volDownColor,
+          }));
+          volumeSeries.setData(volumeData);
+          volumeSeriesRef.current = volumeSeries;
+        } else {
+          // No volume pane — reclaim the bottom margin for the candle series.
+          series.priceScale().applyOptions({
+            scaleMargins: { top: 0.08, bottom: 0.04 },
+          });
+        }
+
+        addOverlayLines(series);
+        break;
+      }
+      case "bar": {
+        if (!hasRenderableData(chartStyle, candleData, lineData).ready) break;
+        const series = chart.addSeries(BarSeries, {
+          upColor: chartTheme.upColor,
+          downColor: chartTheme.downColor,
+          openVisible: true,
+          // Keep proportional bar widths (matches v4 behaviour). v5 still
+          // accepts this option but flipped the default to `true`, which
+          // would render visibly thinner bars without this explicit override.
+          thinBars: false,
+          lastValueVisible: false,
+          priceLineVisible: false,
+        });
+        const formatted = candleData.map((c) => ({
+          time: (Math.floor(c.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        }));
+        series.setData(formatted);
+        seriesRef.current = series;
+        addOverlayLines(series);
+        break;
+      }
+      case "line": {
+        if (!hasRenderableData(chartStyle, candleData, lineData).ready) break;
+        const series = chart.addSeries(LineSeries, {
+          color: chartTheme.upColor,
           lineWidth: 2,
-          lineStyle: LineStyle.Solid,
-          axisLabelVisible: true,
-          title: "Liq",
+          // Same rationale as candle series — only the mark price should show
+          // as a price-axis label. DEX last-close goes away.
+          lastValueVisible: false,
+          priceLineVisible: false,
         });
+        const formatted = lineData.map((p) => ({
+          time: (Math.floor(p.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
+          value: p.price,
+        }));
+        series.setData(formatted);
+        seriesRef.current = series;
+        addOverlayLines(series);
+        break;
       }
-
-      // Entry price on line chart
-      if (entryPriceNum != null && entryPriceNum > 0) {
-        entryLineRef.current = series.createPriceLine({
-          price: entryPriceNum,
-          color: "#22d3ee",
-          lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: "Entry",
+      case "area": {
+        if (!hasRenderableData(chartStyle, candleData, lineData).ready) break;
+        // Brand purple (--accent in globals.css) gives the area mode a distinct
+        // identity vs. the green line series — same data, different feel.
+        const ACCENT = "#9945FF";
+        const series = chart.addSeries(AreaSeries, {
+          lineColor: ACCENT,
+          topColor: `${ACCENT}66`,    // ~40% alpha at the top
+          bottomColor: `${ACCENT}00`, // fade to transparent at the bottom
+          lineWidth: 2,
+          lastValueVisible: false,
+          priceLineVisible: false,
         });
+        const formatted = lineData.map((p) => ({
+          time: (Math.floor(p.timestamp / 1000)) as import("lightweight-charts").UTCTimestamp,
+          value: p.price,
+        }));
+        series.setData(formatted);
+        seriesRef.current = series;
+        addOverlayLines(series);
+        break;
       }
+      default:
+        return assertNever(chartStyle);
     }
 
-    chart.timeScale().fitContent();
-  }, [chartType, candleData, lineData, priceUsd, liqPriceE6, entryPriceNum, chartTheme]);
+    // Crosshair-hover OHLCV readout. Publishes the bar under the cursor to
+    // hoverBar state so the overlay tooltip can render it. Clears on leave.
+    const crosshairHandler = (param: Parameters<Parameters<IChartApi["subscribeCrosshairMove"]>[0]>[0]) => {
+      if (!param.time || !param.point || !seriesRef.current) {
+        setHoverBar(null);
+        return;
+      }
+      const data = param.seriesData.get(seriesRef.current) as
+        | { open?: number; high?: number; low?: number; close?: number; value?: number }
+        | undefined;
+      if (!data) {
+        setHoverBar(null);
+        return;
+      }
+      let volume = 0;
+      if (volumeSeriesRef.current) {
+        const v = param.seriesData.get(volumeSeriesRef.current) as { value?: number } | undefined;
+        if (v?.value != null) volume = v.value;
+      }
+      const isCandle = data.open != null && data.high != null && data.low != null && data.close != null;
+      setHoverBar({
+        time: Number(param.time),
+        open: data.open ?? data.value ?? 0,
+        high: data.high ?? data.value ?? 0,
+        low: data.low ?? data.value ?? 0,
+        close: data.close ?? data.value ?? 0,
+        volume,
+        isCandle,
+      });
+    };
+    chart.subscribeCrosshairMove(crosshairHandler);
+
+    // Only fit the content to viewport on the FIRST render for the current
+    // (timeframe, data-kind, data source) combo. Subsequent polls just
+    // update-in-place so the user's pan/zoom is preserved.
+    //
+    // Bucket by data shape (chartDataKind): candle variants + bar all read
+    // OHLC; line + area both read the single-value lineData stream. Flipping
+    // between styles that share a data source preserves pan/zoom; only
+    // switching kinds (candle ↔ line) refits the viewport.
+    const source = hasPercolatorData
+      ? "percolator"
+      : hasPythData
+        ? "pyth"
+        : hasExternalData
+          ? "dex"
+          : "oracle";
+    const fitKey = `${chartDataKind(chartStyle)}:${timeframe}:${source}`;
+    if (fitKeyRef.current !== fitKey) {
+      chart.timeScale().fitContent();
+      fitKeyRef.current = fitKey;
+    }
+
+    return () => {
+      chart.unsubscribeCrosshairMove(crosshairHandler);
+    };
+  }, [chartStyle, timeframe, candleData, lineData, priceUsd, liqPriceE6, entryPriceNum, chartTheme, hasPercolatorData, hasPythData, hasExternalData, overlayPrefs.entry, overlayPrefs.liq]);
 
   // Update mark price line when live price changes
   useEffect(() => {
@@ -392,13 +718,14 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
     }
   }, [priceUsd]);
 
-  // Compute price stats for header
+  // Header % change is ALWAYS trailing 24 h vs current — the industry
+  // convention users expect, independent of what timeframe/zoom they picked.
+  // Extracted into a pure helper so the daily-bar edge case (cutoff falls
+  // inside the current day's bar, making the delta always 0) can be unit-tested.
   const activeData = lineData.length > 0 ? lineData : oracleFiltered;
   const currentPrice = activeData[activeData.length - 1]?.price ?? priceUsd ?? 0;
-  const firstPrice = activeData[0]?.price ?? currentPrice;
-  const priceChange = currentPrice - firstPrice;
-  const priceChangePercent = firstPrice > 0 ? (priceChange / firstPrice) * 100 : 0;
-  const isUp = priceChange >= 0;
+  const ref24h = computeRef24h(activeData, timeframe, currentPrice);
+  const { priceChange, priceChangePercent, isUp } = computePriceChange(currentPrice, ref24h);
 
   // GH#1652: do NOT early-return here — the chart container must always mount
   // so that lightweight-charts can create its canvas. Sparse/empty state is
@@ -407,17 +734,33 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
 
   return (
     <div className="rounded-none border border-[var(--border)] bg-[var(--bg)] p-3">
-      {/* Header */}
+      {/* Header — shows timeframe % change + data-source badge only.
+          The DEX pool's last-close price used to live here too (e.g. "$84.20 DEX")
+          but that contradicted the mark price shown in the market info bar above,
+          and the only price on the chart should be the mark. */}
       <div className="mb-3 flex flex-wrap items-start justify-between gap-y-2">
         <div className="min-w-0">
-          <div className="text-2xl font-bold" style={{ fontFamily: "var(--font-mono)", fontVariantNumeric: "tabular-nums", color: isUp ? "var(--long)" : "var(--short)" }}>
-            ${currentPrice.toFixed(currentPrice < 1 ? 4 : 2)}
-          </div>
           <div className="flex items-center gap-2">
             <span className="text-xs" style={{ color: isUp ? "var(--long)" : "var(--short)" }}>
               {isUp ? "+" : ""}{priceChange.toFixed(4)} ({isUp ? "+" : ""}{priceChangePercent.toFixed(2)}%)
             </span>
-            {hasExternalData ? (
+            {hasPercolatorData ? (
+              <span
+                className="text-[9px] font-medium uppercase tracking-[0.08em] px-1.5 py-0.5 rounded-sm"
+                style={{ background: "var(--accent)/0.1", color: "var(--accent)", border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)" }}
+                title="Source: Percolator match engine (internal trades)"
+              >
+                PERC
+              </span>
+            ) : hasPythData ? (
+              <span
+                className="text-[9px] font-medium uppercase tracking-[0.08em] px-1.5 py-0.5 rounded-sm"
+                style={{ background: "var(--accent)/0.1", color: "var(--accent)", border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)" }}
+                title={`Source: Pyth Benchmarks · ${pythSymbol}`}
+              >
+                PYTH
+              </span>
+            ) : hasExternalData ? (
               <span
                 className="text-[9px] font-medium uppercase tracking-[0.08em] px-1.5 py-0.5 rounded-sm"
                 style={{ background: "var(--accent)/0.1", color: "var(--accent)", border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)" }}
@@ -441,28 +784,15 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
 
         {/* Controls */}
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex gap-1 rounded-none border border-[var(--border)] bg-[var(--bg-elevated)] p-0.5">
-            <button
-              onClick={() => setChartType("line")}
-              className={`rounded-none px-2 py-1 text-xs transition-colors ${
-                chartType === "line"
-                  ? "bg-[var(--accent)]/10 text-[var(--accent)]"
-                  : "text-[var(--text-dim)] hover:text-[var(--text-secondary)]"
-              }`}
-            >
-              Line
-            </button>
-            <button
-              onClick={() => setChartType("candle")}
-              className={`rounded-none px-2 py-1 text-xs transition-colors ${
-                chartType === "candle"
-                  ? "bg-[var(--accent)]/10 text-[var(--accent)]"
-                  : "text-[var(--text-dim)] hover:text-[var(--text-secondary)]"
-              }`}
-            >
-              Candle
-            </button>
-          </div>
+          <ChartStyleMenu value={chartStyle} onChange={setChartStyle} />
+          <ChartDisplayMenu prefs={overlayPrefs} onToggle={setOverlayPref} />
+          <ChartIndicatorMenu
+            indicators={indicators}
+            addIndicator={addIndicator}
+            removeIndicator={removeIndicator}
+            updateIndicator={updateIndicator}
+            clearAll={clearAllIndicators}
+          />
 
           {/* PERC-8090: 1m/5m/15m/1h/4h/1d only — 7d/30d collapsed */}
           <div className="flex gap-1 rounded-none border border-[var(--border)] bg-[var(--bg-elevated)] p-0.5">
@@ -470,7 +800,7 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
               <button
                 key={tf}
                 onClick={() => setTimeframe(tf)}
-                className={`rounded-none px-2 py-1 text-xs transition-colors ${
+                className={`rounded-none px-1.5 sm:px-2 py-1 text-xs transition-colors ${
                   timeframe === tf
                     ? "bg-[var(--accent)]/10 text-[var(--accent)]"
                     : "text-[var(--text-dim)] hover:text-[var(--text-secondary)]"
@@ -495,7 +825,9 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
         {/* GH#1652: always mount the container so lightweight-charts canvas initialises.
             The chart ref is always created in useEffect; empty-state is overlaid on top
             when candles=[] so the canvas element exists in the DOM on first render. */}
-        <div ref={containerRef} className="w-full h-[40svh] lg:h-[500px]" />
+        {/* Bumped desktop height 500 → 620 so the time axis has room to render
+            below the candles + volume pane without getting visually clipped. */}
+        <div ref={containerRef} className="w-full h-[45svh] lg:h-[620px]" />
 
         {/* GH#1652: empty-state overlay — shown when no data yet, sits above canvas */}
         {showEmptyOverlay && (
@@ -554,7 +886,7 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
         )}
 
         {/* Phase 2: Volume no-data overlay — shown when volume pane exists but all volumes are 0 */}
-        {!showEmptyOverlay && chartType === "candle" && !hasVolumeData && (
+        {!showEmptyOverlay && isCandleStyle(chartStyle) && !hasVolumeData && (
           <div className="pointer-events-none absolute bottom-0 left-0 right-0 flex h-[20%] items-center justify-center border-t border-[var(--border)]/30">
             <span className="text-[9px] text-[var(--text-dim)] uppercase tracking-[0.12em]">
               ── Volume (no data) ──
@@ -562,8 +894,34 @@ export const TradingChart: FC<{ slabAddress: string; mintAddress?: string }> = (
           </div>
         )}
 
-        {/* Phase 2: Position summary badge overlay */}
-        <PositionSummary slabAddress={slabAddress} />
+        {/* OHLCV tooltip — hover the chart to see the bar under the crosshair.
+            Positioned top-left so it never sits under the PositionSummary badge
+            top-right. Hidden entirely when not hovering. */}
+        {hoverBar && !showEmptyOverlay && (
+          <div
+            className="pointer-events-none absolute top-2 left-2 z-10 rounded-none border border-[var(--border)]/60 bg-[var(--bg)]/90 px-2 py-1 font-mono text-[10px] shadow-sm backdrop-blur-sm"
+            aria-hidden="true"
+          >
+            <div className="flex items-center gap-3 whitespace-nowrap">
+              {hoverBar.isCandle ? (
+                <>
+                  <span className="text-[var(--text-dim)]">O <span className="text-[var(--text)]">{hoverBar.open.toFixed(hoverBar.open < 1 ? 6 : 2)}</span></span>
+                  <span className="text-[var(--text-dim)]">H <span className="text-[var(--text)]">{hoverBar.high.toFixed(hoverBar.high < 1 ? 6 : 2)}</span></span>
+                  <span className="text-[var(--text-dim)]">L <span className="text-[var(--text)]">{hoverBar.low.toFixed(hoverBar.low < 1 ? 6 : 2)}</span></span>
+                  <span className="text-[var(--text-dim)]">C <span className="text-[var(--text)]" style={{ color: hoverBar.close >= hoverBar.open ? "var(--long)" : "var(--short)" }}>{hoverBar.close.toFixed(hoverBar.close < 1 ? 6 : 2)}</span></span>
+                </>
+              ) : (
+                <span className="text-[var(--text-dim)]">Price <span className="text-[var(--text)]">{hoverBar.close.toFixed(hoverBar.close < 1 ? 6 : 2)}</span></span>
+              )}
+              {hoverBar.volume > 0 && (
+                <span className="text-[var(--text-dim)]">V <span className="text-[var(--text)]">{hoverBar.volume.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {overlayPrefs.position && <PositionSummary slabAddress={slabAddress} />}
+        {overlayPrefs.pnl && <ChartPnlBadge slabAddress={slabAddress} />}
       </div>
     </div>
   );

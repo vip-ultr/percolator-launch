@@ -79,26 +79,37 @@ export function getRpcEndpoint(): string {
  * Get WebSocket endpoint for Solana Connection subscriptions.
  * The HTTP proxy at /api/rpc doesn't support WebSocket upgrades,
  * so we connect directly to Helius WSS for real-time subscriptions.
- * Returns undefined if no Helius key is configured (disables WS subscriptions).
+ * Always returns a valid WSS URL — Helius if configured, public Solana RPC otherwise.
  */
-export function getWsEndpoint(): string | undefined {
+export function getWsEndpoint(): string {
   // PERC-469: Use only the dedicated WS key (safe to expose: WS-only, rate-limited).
   // NEXT_PUBLIC_HELIUS_API_KEY has been removed; HELIUS_API_KEY is server-only and
   // unavailable on the client, so we cannot use it here.
   const apiKey = (process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY ?? "").trim();
-  if (!apiKey) return undefined;
-
   const net = getNetwork();
+
+  if (apiKey) {
+    return net === "mainnet"
+      ? `wss://mainnet.helius-rpc.com/?api-key=${apiKey}`
+      : `wss://devnet.helius-rpc.com/?api-key=${apiKey}`;
+  }
+
+  // No dedicated WS key — fall back to public Solana WS endpoints.
+  // Rate-limited but functional for real-time subscriptions.
+  // We MUST return a valid WSS URL (not undefined) because @solana/web3.js
+  // auto-derives wss:// from the HTTP endpoint when wsEndpoint is falsy,
+  // and on the client the HTTP endpoint is /api/rpc (a proxy that doesn't
+  // support WS upgrades), causing reconnect storms on Vercel (#869).
   return net === "mainnet"
-    ? `wss://mainnet.helius-rpc.com/?api-key=${apiKey}`
-    : `wss://devnet.helius-rpc.com/?api-key=${apiKey}`;
+    ? "wss://api.mainnet-beta.solana.com"
+    : "wss://api.devnet.solana.com";
 }
 
 const CONFIGS = {
   mainnet: {
     get rpcUrl() { return getRpcEndpoint(); },
-    programId: "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24",
-    matcherProgramId: "DHP6DtwXP1yJsz8YzfoeigRFPB979gzmumkmCxDLSkUX",
+    programId: "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv",
+    matcherProgramId: "GDK8wx38kpiSVSfGTVNiSdptX3Z5R4kQyqh6Q3QX6wmi",
     crankWallet: "8y7sXswvGo6fWa4daCnxaE3znaFoBs6QJXLTzCLYXotV",  // mainnet keeper crank wallet
     explorerUrl: "https://solscan.io",
   },
@@ -113,10 +124,11 @@ const CONFIGS = {
     // small:  256 slots  (~0.44 SOL rent) — --features small
     // medium: 1024 slots (~1.8 SOL rent)  — --features medium
     // large:  4096 slots (~7 SOL rent)    — default build (no features)
+    // v12.17: micro tier removed — only small/medium/large
     programsBySlabTier: {
-      small: "FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn",   // 256 slots
+      small:  "FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn",  // 256 slots
       medium: "g9msRSV3sJmmE3r5Twn9HuBsxzuuRGTjKCVTKudm9in",   // 1024 slots
-      large: "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",    // 4096 slots (confirmed working)
+      large:  "FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD",  // 4096 slots (confirmed working)
     } satisfies Record<string, string>,
     // PERC-356: Test USDC mint for auto-fund on wallet connect
     testUsdcMint:
@@ -177,6 +189,21 @@ export function getConfig() {
       ? (baseConfig as typeof CONFIGS.devnet).programsBySlabTier
       : undefined,
   };
+}
+
+/**
+ * Get all unique program ID strings from config (default + all slab tier programs).
+ * Shared utility — avoids duplicating this logic across hooks.
+ */
+export function getAllProgramIds(): string[] {
+  const cfg = getConfig();
+  const ids = new Set<string>();
+  if (cfg.programId) ids.add(cfg.programId);
+  const byTier = cfg.programsBySlabTier;
+  if (byTier) {
+    Object.values(byTier).forEach((id) => { if (id) ids.add(id); });
+  }
+  return [...ids];
 }
 
 export function setNetwork(network: Network) {

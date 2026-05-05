@@ -39,6 +39,78 @@ export type Database = {
   }
   public: {
     Tables: {
+      admin_users: {
+        Row: {
+          id: number
+          email: string
+          created_at: string | null
+        }
+        Insert: {
+          id?: number
+          email: string
+          created_at?: string | null
+        }
+        Update: {
+          id?: number
+          email?: string
+          created_at?: string | null
+        }
+        Relationships: []
+      }
+      airdrop_claims: {
+        Row: {
+          id: number
+          wallet: string
+          market_address: string
+          claimed_at: string
+          amount_tokens: number | null
+          amount_usd: number | null
+          signature: string | null
+        }
+        Insert: {
+          id?: number
+          wallet: string
+          market_address: string
+          claimed_at?: string
+          amount_tokens?: number | null
+          amount_usd?: number | null
+          signature?: string | null
+        }
+        Update: {
+          id?: number
+          wallet?: string
+          market_address?: string
+          claimed_at?: string
+          amount_tokens?: number | null
+          amount_usd?: number | null
+          signature?: string | null
+        }
+        Relationships: []
+      }
+      auto_fund_log: {
+        Row: {
+          id: number
+          wallet: string
+          sol_airdropped: boolean
+          usdc_minted: boolean
+          created_at: string | null
+        }
+        Insert: {
+          id?: number
+          wallet: string
+          sol_airdropped?: boolean
+          usdc_minted?: boolean
+          created_at?: string | null
+        }
+        Update: {
+          id?: number
+          wallet?: string
+          sol_airdropped?: boolean
+          usdc_minted?: boolean
+          created_at?: string | null
+        }
+        Relationships: []
+      }
       bug_reports: {
         Row: {
           actual_behavior: string | null
@@ -102,6 +174,66 @@ export type Database = {
         }
         Relationships: []
       }
+      devnet_airdrop_claims: {
+        Row: {
+          id: number
+          wallet: string
+          mint: string
+          claimed_at: string
+        }
+        Insert: {
+          id?: number
+          wallet: string
+          mint: string
+          claimed_at?: string
+        }
+        Update: {
+          id?: number
+          wallet?: string
+          mint?: string
+          claimed_at?: string
+        }
+        Relationships: []
+      }
+      devnet_mints: {
+        Row: {
+          id: number
+          mainnet_ca: string
+          devnet_mint: string
+          market_address: string | null
+          symbol: string | null
+          name: string | null
+          decimals: number | null
+          logo_url: string | null
+          creator_wallet: string | null
+          created_at: string | null
+        }
+        Insert: {
+          id?: number
+          mainnet_ca: string
+          devnet_mint: string
+          market_address?: string | null
+          symbol?: string | null
+          name?: string | null
+          decimals?: number | null
+          logo_url?: string | null
+          creator_wallet?: string | null
+          created_at?: string | null
+        }
+        Update: {
+          id?: number
+          mainnet_ca?: string
+          devnet_mint?: string
+          market_address?: string | null
+          symbol?: string | null
+          name?: string | null
+          decimals?: number | null
+          logo_url?: string | null
+          creator_wallet?: string | null
+          created_at?: string | null
+        }
+        Relationships: []
+      }
       funding_history: {
         Row: {
           funding_index_qpb_e6: string
@@ -160,6 +292,27 @@ export type Database = {
           },
         ]
       }
+      ideas: {
+        Row: {
+          id: number
+          handle: string
+          idea: string
+          created_at: string | null
+        }
+        Insert: {
+          id?: number
+          handle: string
+          idea: string
+          created_at?: string | null
+        }
+        Update: {
+          id?: number
+          handle?: string
+          idea?: string
+          created_at?: string | null
+        }
+        Relationships: []
+      }
       insurance_history: {
         Row: {
           balance: number
@@ -211,6 +364,30 @@ export type Database = {
             referencedColumns: ["slab_address"]
           },
         ]
+      }
+      insurance_snapshots: {
+        Row: {
+          id: number
+          slab: string
+          redemption_rate_e6: number
+          network: string
+          created_at: string | null
+        }
+        Insert: {
+          id?: number
+          slab: string
+          redemption_rate_e6: number
+          network?: string
+          created_at?: string | null
+        }
+        Update: {
+          id?: number
+          slab?: string
+          redemption_rate_e6?: number
+          network?: string
+          created_at?: string | null
+        }
+        Relationships: []
       }
       job_applications: {
         Row: {

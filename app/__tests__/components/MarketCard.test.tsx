@@ -25,7 +25,7 @@ import { MarketBrowser } from "@/components/market/MarketBrowser";
 import { useMarketDiscovery } from "@/hooks/useMarketDiscovery";
 import { useMultiTokenMeta } from "@/hooks/useMultiTokenMeta";
 import { PublicKey } from "@solana/web3.js";
-import type { DiscoveredMarket } from "@percolator/sdk";
+import type { DiscoveredMarket } from "@percolatorct/sdk";
 
 // Mock Next.js
 vi.mock("next/link", () => ({
@@ -161,13 +161,13 @@ describe("MarketBrowser Component Tests", () => {
     it("should render markets without search for now", () => {
       const mockMarkets = [createMockMarket()];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -188,13 +188,13 @@ describe("MarketBrowser Component Tests", () => {
     it("should display markets without URL filters for now", () => {
       const mockMarkets = [createMockMarket()];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -218,13 +218,13 @@ describe("MarketBrowser Component Tests", () => {
         createMockMarket({ slabAddress: new PublicKey("8rxVYS7HdWpmqGgNPTCZXTqGATZLde9Lv5e9kaUrZGCQ") }),
       ];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -259,13 +259,13 @@ describe("MarketBrowser Component Tests", () => {
       
       const mockMarkets = [market1, market2];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -295,13 +295,13 @@ describe("MarketBrowser Component Tests", () => {
       
       const mockMarkets = [market1, market2];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -316,14 +316,14 @@ describe("MarketBrowser Component Tests", () => {
     it("should handle missing metadata gracefully", () => {
       const mockMarkets = [createMockMarket()];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
       // Empty metadata map
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<MarketBrowser />);
 
@@ -336,13 +336,13 @@ describe("MarketBrowser Component Tests", () => {
     it("should display markets without search functionality for now", () => {
       const mockMarkets = [createMockMarket()];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -360,13 +360,13 @@ describe("MarketBrowser Component Tests", () => {
 
   describe("Edge Cases and Error Handling", () => {
     it("should show loading state", () => {
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: [],
         loading: true,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<MarketBrowser />);
 
@@ -374,13 +374,13 @@ describe("MarketBrowser Component Tests", () => {
     });
 
     it("should show error state with helpful message", () => {
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: [],
         loading: false,
         error: "PROGRAM_ID not configured",
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<MarketBrowser />);
 
@@ -391,13 +391,13 @@ describe("MarketBrowser Component Tests", () => {
     });
 
     it("should show empty state when no markets exist", () => {
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: [],
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<MarketBrowser />);
 
@@ -413,13 +413,13 @@ describe("MarketBrowser Component Tests", () => {
       
       const mockMarkets = [market];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -441,13 +441,13 @@ describe("MarketBrowser Component Tests", () => {
         }),
       ];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -466,13 +466,13 @@ describe("MarketBrowser Component Tests", () => {
       market.config.indexFeedId = zeroKey; // Hyperp DEX oracle
       const mockMarkets = [market];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -489,13 +489,13 @@ describe("MarketBrowser Component Tests", () => {
       market.config.oracleAuthority = zeroKey; // zero authority → pyth-pinned
       const mockMarkets = [market];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -512,13 +512,13 @@ describe("MarketBrowser Component Tests", () => {
       market.config.oracleAuthority = adminKey; // non-zero authority → admin
       const mockMarkets = [market];
 
-      (useMarketDiscovery as any).mockReturnValue({
+      vi.mocked(useMarketDiscovery).mockReturnValue({
         markets: mockMarkets,
         loading: false,
         error: null,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 

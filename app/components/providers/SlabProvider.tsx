@@ -23,7 +23,7 @@ import {
   type EngineState,
   type RiskParams,
   type Account,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import { isMockSlab, getMockSlabState } from "@/lib/mock-trade-data";
 import { isMockMode } from "@/lib/mock-mode";
 
@@ -114,8 +114,9 @@ export const SlabProvider: FC<{ children: ReactNode; slabAddress: string }> = ({
     }
     let cancelled = false;
 
-    // Current expected slab version — bump when program is upgraded with schema changes
-    const EXPECTED_SLAB_VERSION = 1;
+    // Current expected slab version — bump when program is upgraded with schema changes.
+    // V12_1 deployed program writes version=0 in the slab header.
+    const EXPECTED_SLAB_VERSION = 0;
 
     function parseSlab(data: Uint8Array, owner?: PublicKey) {
       if (cancelled) return;

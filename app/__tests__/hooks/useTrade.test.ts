@@ -37,8 +37,8 @@ const mockLpPda = new PublicKey("3yEEksiUkq5K2PmjbRSHpXVN4FJgYuNn7rV31ek3PCwu");
 const mockOraclePda = new PublicKey("8DjWTsU1o8RHTKpRsqGFyYqFMknb8g7z2mjLfVYUyYyF");
 const mockVaultAuth = new PublicKey("DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1");
 
-vi.mock("@percolator/sdk", async () => {
-  const actual = await vi.importActual("@percolator/sdk");
+vi.mock("@percolatorct/sdk", async () => {
+  const actual = await vi.importActual("@percolatorct/sdk");
   return {
     ...actual,
     deriveLpPda: vi.fn(() => [mockLpPda, 255]),
@@ -104,10 +104,10 @@ describe("useTrade", () => {
       programId: mockProgramId,
     };
 
-    ( useConnectionCompat as any).mockReturnValue({ connection: mockConnection });
-    ( useWalletCompat as any).mockReturnValue(mockWallet);
-    (useSlabState as any).mockReturnValue(mockSlabState);
-    (sendTx as any).mockResolvedValue({ signature: "mock-signature" });
+    vi.mocked(useConnectionCompat).mockReturnValue({ connection: mockConnection });
+    vi.mocked(useWalletCompat).mockReturnValue(mockWallet);
+    vi.mocked(useSlabState).mockReturnValue(mockSlabState);
+    vi.mocked(sendTx).mockResolvedValue({ signature: "mock-signature" });
 
     // Mock fetch for backend price API (PERC-8328: price required, no fallback allowed)
     global.fetch = vi.fn().mockResolvedValue({
@@ -139,25 +139,26 @@ describe("useTrade", () => {
       expect(result.current.error).toBeNull();
       
       // Verify instructions include crank + trade
-      const txCall = (sendTx as any).mock.calls[0][0];
+      const txCall = vi.mocked(sendTx).mock.calls[0][0];
       expect(txCall.instructions).toHaveLength(2); // crank + trade
     });
 
-    it("should include oracle price push for admin oracle markets", async () => {
+    it("rejects inline oracle pushes for admin markets until the server-side flow is wired in", async () => {
       mockSlabState.config.oracleAuthority = mockWalletPubkey;
       
       const { result } = renderHook(() => useTrade(mockSlabAddress));
 
       await act(async () => {
-        await result.current.trade({
-          lpIdx: 0,
-          userIdx: 1,
-          size: 1000000n,
-        });
+        await expect(
+          result.current.trade({
+            lpIdx: 0,
+            userIdx: 1,
+            size: 1000000n,
+          })
+        ).rejects.toThrow(/server-side oracle publisher/i);
       });
 
-      const txCall = (sendTx as any).mock.calls[0][0];
-      expect(txCall.instructions).toHaveLength(3); // push price + crank + trade
+      expect(sendTx).not.toHaveBeenCalled();
     });
   });
 
@@ -172,7 +173,7 @@ describe("useTrade", () => {
 
   describe("Error Handling", () => {
     it("should throw error if wallet not connected", async () => {
-      ( useWalletCompat as any).mockReturnValue({ publicKey: null, connected: false });
+      vi.mocked(useWalletCompat).mockReturnValue({ publicKey: null, connected: false });
 
       const { result } = renderHook(() => useTrade(mockSlabAddress));
 
@@ -222,8 +223,8 @@ describe("useTrade", () => {
   });
 
   describe("Oracle Mode Detection", () => {
-    it("should detect admin oracle when authority is set", async () => {
-      mockSlabState.config.oracleAuthority = mockWalletPubkey;
+    it("should detect admin oracle when authority is set but another publisher is responsible", async () => {
+      mockSlabState.config.oracleAuthority = new PublicKey("9n2E7x6u7sGeqXEt3G5UpiRaY1oCbcnZ6FQcmGeXgn6M");
       
       const { result } = renderHook(() => useTrade(mockSlabAddress));
 
@@ -240,7 +241,7 @@ describe("useTrade", () => {
     });
 
     it("should detect admin oracle when feed is all zeros", async () => {
-      mockSlabState.config.indexFeedId.toBytes = () => new Array(32).fill(0);
+      mockSlabState.config.indexFeedId = PublicKey.default;
       
       const { result } = renderHook(() => useTrade(mockSlabAddress));
 
@@ -257,7 +258,7 @@ describe("useTrade", () => {
 
     it("should use Pyth oracle for standard markets", async () => {
       mockSlabState.config.oracleAuthority = PublicKey.default;
-      mockSlabState.config.indexFeedId.toBytes = () => new Array(32).fill(1);
+      mockSlabState.config.indexFeedId = new PublicKey(new Uint8Array(32).fill(1));
       
       const { result } = renderHook(() => useTrade(mockSlabAddress));
 
@@ -276,7 +277,7 @@ describe("useTrade", () => {
   describe("Loading State", () => {
     it("should set loading state during trade execution", async () => {
       let resolveSendTx: any;
-      (sendTx as any).mockReturnValue(
+      vi.mocked(sendTx).mockReturnValue(
         new Promise((resolve) => {
           resolveSendTx = resolve;
         })

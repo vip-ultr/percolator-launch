@@ -19,7 +19,7 @@ import { useEngineState } from "@/hooks/useEngineState";
 import { useSlabState } from "@/components/providers/SlabProvider";
 import { useTokenMeta } from "@/hooks/useTokenMeta";
 import { useLivePrice } from "@/hooks/useLivePrice";
-import { AccountKind } from "@percolator/sdk";
+import { AccountKind } from "@percolatorct/sdk";
 import { PublicKey } from "@solana/web3.js";
 
 // Mock Privy (used directly by TradeForm for login)
@@ -77,18 +77,18 @@ describe("TradeForm Component Tests", () => {
     vi.clearAllMocks();
     
     // Default mock implementations
-    (useWalletCompat as any).mockReturnValue({
+    vi.mocked(useWalletCompat).mockReturnValue({
       connected: true,
       publicKey: mockPublicKey,
     });
     
-    (useTrade as any).mockReturnValue({
+    vi.mocked(useTrade).mockReturnValue({
       trade: mockTrade,
       loading: false,
       error: null,
     });
     
-    (useEngineState as any).mockReturnValue({
+    vi.mocked(useEngineState).mockReturnValue({
       engine: {
         vault: 100000000000n, // 100k tokens
       },
@@ -100,7 +100,7 @@ describe("TradeForm Component Tests", () => {
       },
     });
     
-    (useSlabState as any).mockReturnValue({
+    vi.mocked(useSlabState).mockReturnValue({
       accounts: [
         {
           idx: 0,
@@ -117,13 +117,14 @@ describe("TradeForm Component Tests", () => {
       },
     });
     
-    (useTokenMeta as any).mockReturnValue({
+    vi.mocked(useTokenMeta).mockReturnValue({
       symbol: "SOL",
       decimals: 6,
     });
     
-    (useLivePrice as any).mockReturnValue({
+    vi.mocked(useLivePrice).mockReturnValue({
       priceUsd: 100,
+      priceE6: 100_000_000n,
     });
   });
   
@@ -131,7 +132,7 @@ describe("TradeForm Component Tests", () => {
     it.skip("should format large BigInt values correctly", () => {
       const capital = 123456789012345678n;
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -152,7 +153,7 @@ describe("TradeForm Component Tests", () => {
     });
     
     it.skip("should handle zero BigInt values", () => {
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -173,7 +174,7 @@ describe("TradeForm Component Tests", () => {
     it.skip("should handle decimal precision correctly", () => {
       const capital = 1500000n; // 1.5 SOL with 6 decimals
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -197,7 +198,7 @@ describe("TradeForm Component Tests", () => {
       const user = userEvent.setup();
       const capital = 5000000n; // 5 SOL
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -213,17 +214,18 @@ describe("TradeForm Component Tests", () => {
       
       const maxButton = screen.getByRole("button", { name: /max/i });
       const input = screen.getByPlaceholderText("0.000000");
-      
+
       await user.click(maxButton);
-      
-      // PERC-8090: Max now populates contracts input (5 contracts at 1x leverage)
-      expect(input).toHaveValue("5.000000");
+
+      // PERC-8090: Max fills margin=100% of balance, then derives contracts.
+      // margin=5 SOL, notional=5*1=5 USD, contracts=5/100=0.05
+      expect(input).toHaveValue("0.050000");
     });
     
     it("should not set value if balance is zero", async () => {
       const user = userEvent.setup();
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -249,7 +251,7 @@ describe("TradeForm Component Tests", () => {
       const user = userEvent.setup();
       const capital = 1234567n; // 1.234567 SOL
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -267,14 +269,15 @@ describe("TradeForm Component Tests", () => {
       const input = screen.getByPlaceholderText("0.000000");
       
       await user.click(maxButton);
-      
-      expect(input).toHaveValue("1.234567");
+
+      // margin=1.234567 SOL, notional=1.234567*1=1.234567 USD, contracts=1.234567/100=0.012346
+      expect(input).toHaveValue("0.012346");
     });
   });
   
   describe("TRADE-007: Invalid amount rejected", () => {
     beforeEach(() => {
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -342,21 +345,21 @@ describe("TradeForm Component Tests", () => {
     
     it("should disable submit button when input is invalid", async () => {
       const user = userEvent.setup();
-      
+
       render(<TradeForm slabAddress="test-slab" />);
-      
+
       const input = screen.getByPlaceholderText("0.000000");
       const submitButton = screen.getByRole("button", { name: /Long 1x/i });
-      
+
       // Empty input should disable button
       expect(submitButton).toBeDisabled();
-      
-      // Valid input should enable button
-      await user.type(input, "5");
+
+      // Valid input should enable button (0.05 contracts = $5 margin at 1x, under 10 SOL balance)
+      await user.type(input, "0.05");
       await waitFor(() => {
         expect(submitButton).not.toBeDisabled();
       });
-      
+
       // Clear input should disable again
       await user.clear(input);
       await waitFor(() => {
@@ -369,7 +372,7 @@ describe("TradeForm Component Tests", () => {
     it("should show connect wallet message when wallet disconnects", async () => {
       const user = userEvent.setup();
       
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -387,7 +390,7 @@ describe("TradeForm Component Tests", () => {
       await user.type(input, "5");
       
       // Simulate wallet disconnect
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: false,
         publicKey: null,
       });
@@ -417,7 +420,7 @@ describe("TradeForm Component Tests", () => {
       vi.mock("@/hooks/useMarketInfo", () => ({
         useMarketInfo: vi.fn(() => ({ market: { max_leverage: 50 } })),
       }));
-      (useUserAccount as any).mockReturnValue({
+      vi.mocked(useUserAccount).mockReturnValue({
         idx: 1,
         account: {
           kind: AccountKind.User,
@@ -433,7 +436,7 @@ describe("TradeForm Component Tests", () => {
     it("uses on-chain cap when Supabase leverage is higher", () => {
       // on-chain: initialMarginBps=1000 → 10x. Supabase says 50x.
       // Expected: maxLeverage is capped at 10x (on-chain), not 50x (Supabase).
-      (useEngineState as any).mockReturnValue({
+      vi.mocked(useEngineState).mockReturnValue({
         engine: { vault: 100000000000n },
         params: {
           riskReductionThreshold: 0n,
@@ -452,7 +455,7 @@ describe("TradeForm Component Tests", () => {
     it("falls back to Supabase when on-chain initialMarginBps is 0 (uninitialised slab)", () => {
       // on-chain: initialMarginBps=0 (uninitialised) → computed = 0. Supabase says 20x.
       // Expected: maxLeverage falls back to Supabase (20x).
-      (useEngineState as any).mockReturnValue({
+      vi.mocked(useEngineState).mockReturnValue({
         engine: { vault: 100000000000n },
         params: {
           riskReductionThreshold: 0n,

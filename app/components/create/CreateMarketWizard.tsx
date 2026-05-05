@@ -7,7 +7,7 @@ import { useCreateMarket, MIN_INIT_MARKET_SEED, type CreateMarketParams } from "
 import { useQuickLaunch } from "@/hooks/useQuickLaunch";
 import { type DexPoolResult } from "@/hooks/useDexPoolSearch";
 import { parseHumanAmount, formatHumanAmount } from "@/lib/parseAmount";
-import { SLAB_TIERS, type SlabTierKey } from "@percolator/sdk";
+import { SLAB_TIERS, type SlabTierKey } from "@percolatorct/sdk";
 import { getNetwork } from "@/lib/config";
 
 import { ModeSelector } from "./ModeSelector";
@@ -508,6 +508,17 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       : wizard.oracleType === "hyperp_ema" ? "hyperp" as const
       : "admin" as const;
 
+    // For hyperp markets the index asset is the DEX pool's base token (e.g. SOL),
+    // not the collateral mint (e.g. USDC). Use baseSymbol/quoteSymbol from the pool
+    // result to build a proper symbol ("SOL") and name ("SOL/USDC Perpetual").
+    // Fall back to tokenMeta for non-hyperp (Pyth / admin oracle) markets.
+    const marketSymbol = oracleMode === "hyperp" && wizard.dexPool
+      ? wizard.dexPool.baseSymbol
+      : (wizard.tokenMeta?.symbol ?? "UNKNOWN");
+    const marketName = oracleMode === "hyperp" && wizard.dexPool
+      ? `${wizard.dexPool.baseSymbol}/${wizard.dexPool.quoteSymbol} Perpetual`
+      : (wizard.tokenMeta?.name ?? "Unknown Token");
+
     const params: CreateMarketParams = {
       mint: new PublicKey(effectiveMint),
       initialPriceE6: priceE6,
@@ -519,8 +530,8 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       initialMarginBps: wizard.initialMarginBps,
       maxAccounts: tier.maxAccounts,
       slabDataSize: tier.dataSize,
-      symbol: wizard.tokenMeta?.symbol ?? "UNKNOWN",
-      name: wizard.tokenMeta?.name ?? "Unknown Token",
+      symbol: marketSymbol,
+      name: marketName,
       decimals,
       mainnetCA: wizard.mintAddress !== effectiveMint ? wizard.mintAddress : undefined,
       oracleMode,
@@ -556,6 +567,14 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       : wizard.oracleType === "hyperp_ema" ? "hyperp" as const
       : "admin" as const;
 
+    // Same symbol/name derivation as handleLaunch — hyperp uses DEX base/quote symbols.
+    const retryMarketSymbol = oracleMode === "hyperp" && wizard.dexPool
+      ? wizard.dexPool.baseSymbol
+      : (wizard.tokenMeta?.symbol ?? "UNKNOWN");
+    const retryMarketName = oracleMode === "hyperp" && wizard.dexPool
+      ? `${wizard.dexPool.baseSymbol}/${wizard.dexPool.quoteSymbol} Perpetual`
+      : (wizard.tokenMeta?.name ?? "Unknown Token");
+
     const params: CreateMarketParams = {
       mint: new PublicKey(effectiveMint),
       initialPriceE6: priceE6,
@@ -567,8 +586,8 @@ export const CreateMarketWizard: FC<{ initialMint?: string }> = ({ initialMint }
       initialMarginBps: wizard.initialMarginBps,
       maxAccounts: tier.maxAccounts,
       slabDataSize: tier.dataSize,
-      symbol: wizard.tokenMeta?.symbol ?? "UNKNOWN",
-      name: wizard.tokenMeta?.name ?? "Unknown Token",
+      symbol: retryMarketSymbol,
+      name: retryMarketName,
       decimals,
       mainnetCA: wizard.mintAddress !== effectiveMint ? wizard.mintAddress : undefined,
       oracleMode,

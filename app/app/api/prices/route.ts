@@ -50,7 +50,7 @@ export async function GET() {
     const db = getServiceClient();
     if (db) {
       // PERC-8195: filter by network so devnet/mainnet prices don't mix
-      const { data: stats, error } = await (db as any)
+      const { data: stats, error } = await db
         .from("market_stats")
         .select("slab_address, mark_price, index_price, updated_at")
         .eq("network", getServerNetwork())

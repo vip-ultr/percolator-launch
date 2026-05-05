@@ -2,10 +2,10 @@ import { PublicKey } from "@solana/web3.js";
 
 /**
  * Maximum valid oracle price in E6 format.
- * Matches the Rust on-chain constant: price <= 1_000_000_000_000_000 (= $1B USD).
- * Values above this are corrupt/uninitialized data and should be treated as zero.
+ * Matches the Rust on-chain constant MAX_ORACLE_PRICE = 1_000_000_000_000.
+ * AUDIT FIX: was 1_000_000_000_000_000 (1000x too large vs on-chain).
  */
-export const MAX_PRICE_E6 = 1_000_000_000_000_000n; // $1,000,000,000 USD
+export const MAX_PRICE_E6 = 1_000_000_000_000n; // $1,000,000 USD (1e12 in E6)
 
 /**
  * Sanitize a price E6 value.

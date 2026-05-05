@@ -6,7 +6,7 @@ import { useWalletCompat } from "@/hooks/useWalletCompat";
 import { useMarketDiscovery } from "@/hooks/useMarketDiscovery";
 import { explorerTxUrl } from "@/lib/config";
 import { useAdminActions } from "@/hooks/useAdminActions";
-import type { DiscoveredMarket } from "@percolator/sdk";
+import type { DiscoveredMarket } from "@percolatorct/sdk";
 
 // ─── Style tokens (matches admin/page.tsx) ────────────────────────────────────
 const card =
@@ -118,7 +118,7 @@ export function OracleAdminSection() {
     setTxResult(null);
     try {
       const result = await setOracleAuthority(selectedMarket, newAuthority.trim());
-      setTxResult({ sig: (result as any)?.signature ?? (result as any)?.sig ?? String(result) });
+      setTxResult({ sig: result });
     } catch (err) {
       setTxResult({ error: err instanceof Error ? err.message : String(err) });
     } finally {

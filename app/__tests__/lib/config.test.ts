@@ -177,19 +177,25 @@ describe("getWsEndpoint", () => {
     expect(getWsEndpoint()).toBe("wss://mainnet.helius-rpc.com/?api-key=ws-key");
   });
 
-  it("returns undefined when NEXT_PUBLIC_HELIUS_WS_API_KEY is not set (PERC-469)", () => {
+  it("falls back to public Solana WS when NEXT_PUBLIC_HELIUS_WS_API_KEY is not set (PERC-469)", () => {
     // HELIUS_API_KEY is server-only and cannot be read client-side — getWsEndpoint()
     // must not fall back to it or any NEXT_PUBLIC_HELIUS_API_KEY (removed in PERC-469).
+    // Instead it returns the public Solana WS endpoint for the current network.
     clearWindow();
     delete process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY;
     process.env.HELIUS_API_KEY = "server-key"; // should be ignored
-    expect(getWsEndpoint()).toBeUndefined();
+    process.env.NEXT_PUBLIC_DEFAULT_NETWORK = "devnet";
+    expect(getWsEndpoint()).toBe("wss://api.devnet.solana.com");
   });
 
-  it("returns undefined when no keys are configured", () => {
+  it("falls back to public Solana WS when no keys are configured", () => {
     clearWindow();
     delete process.env.HELIUS_API_KEY;
     delete process.env.NEXT_PUBLIC_HELIUS_WS_API_KEY;
-    expect(getWsEndpoint()).toBeUndefined();
+    delete process.env.NEXT_PUBLIC_DEFAULT_NETWORK;
+    // getNetwork() defaults to "mainnet" when NEXT_PUBLIC_DEFAULT_NETWORK is unset,
+    // but the test env may have it set — just verify we get a valid public WS URL.
+    const ws = getWsEndpoint();
+    expect(ws).toMatch(/^wss:\/\/api\.(mainnet-beta|devnet)\.solana\.com$/);
   });
 });

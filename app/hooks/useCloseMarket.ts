@@ -1,15 +1,23 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import { PublicKey, Transaction, TransactionInstruction } from "@solana/web3.js";
-import { parseHeader } from "@percolator/sdk";
-import { useWalletCompat } from "@/hooks/useWalletCompat";
-import { useConnectionCompat } from "@/hooks/useWalletCompat";
+import { PublicKey, Transaction } from "@solana/web3.js";
+import { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import {
+  parseHeader,
+  parseConfig,
+  encodeCloseSlab,
+  ACCOUNTS_CLOSE_SLAB,
+  buildAccountMetas,
+  buildIx,
+  deriveVaultAuthority,
+} from "@percolatorct/sdk";
+import { useWalletCompat, useConnectionCompat } from "@/hooks/useWalletCompat";
 
 /**
- * Tag 13 = CloseSlab instruction in percolator-prog.
+ * CloseSlab (IX_TAG.CloseSlab = 13) instruction in percolator-prog.
  * Accounts: [admin(signer, writable), slab(writable)]
- * Data: [13] (1 byte)
+ * Data: encodeCloseSlab() — 1 byte
  *
  * Requirements:
  * - Admin must sign (on-chain guard — mismatch = guaranteed rejection)
@@ -22,7 +30,6 @@ import { useConnectionCompat } from "@/hooks/useWalletCompat";
  * connected wallet is the market admin BEFORE building or sending any tx.
  * Non-admin callers get a clear error with zero fees wasted.
  */
-const TAG_CLOSE_SLAB = 13;
 
 interface CloseResult {
   signature: string;
@@ -98,14 +105,26 @@ export function useCloseMarket() {
           ? new PublicKey(programIdOverride)
           : accountInfo.owner;
 
-        // Build CloseSlab instruction
-        const ix = new TransactionInstruction({
+        // beta.32: ACCOUNTS_CLOSE_SLAB expanded to 6 accounts:
+        // dest (admin/signer), slab, vault, vaultAuthority, destAta, tokenProgram
+        const slabConfig = parseConfig(accountInfo.data);
+        const vaultPubkey = slabConfig.vaultPubkey;
+        const collateralMint = slabConfig.collateralMint;
+        const [vaultAuthority] = deriveVaultAuthority(programId, slabPk);
+        const destAta = await getAssociatedTokenAddress(collateralMint, walletCompat.publicKey);
+
+        // Build CloseSlab instruction via SDK encode helpers
+        const ix = buildIx({
           programId,
-          keys: [
-            { pubkey: walletCompat.publicKey, isSigner: true, isWritable: true },
-            { pubkey: slabPk, isSigner: false, isWritable: true },
-          ],
-          data: Buffer.from([TAG_CLOSE_SLAB]),
+          keys: buildAccountMetas(ACCOUNTS_CLOSE_SLAB, {
+            dest: walletCompat.publicKey,
+            slab: slabPk,
+            vault: vaultPubkey,
+            vaultAuthority,
+            destAta,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          }),
+          data: encodeCloseSlab(),
         });
 
         const { blockhash } = await connection.getLatestBlockhash("confirmed");
@@ -127,8 +146,8 @@ export function useCloseMarket() {
 
         setLoading(false);
         return { signature: sig, reclaimedLamports: reclaimableLamports };
-      } catch (err: any) {
-        const msg = err?.message ?? String(err);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
 
         // Parse common CloseSlab failures
         if (msg.includes("0xd") || msg.includes("EngineInsufficientBalance")) {

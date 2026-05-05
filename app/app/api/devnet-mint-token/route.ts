@@ -32,12 +32,15 @@ import {
 import { getConfig } from "@/lib/config";
 import { getServiceClient } from "@/lib/supabase";
 import { getDevnetMintSigner } from "@/lib/devnet-signer";
+import { validateTokenMetadata, validateDexScreenerResponse } from "@/lib/token-metadata-validators";
 import * as Sentry from "@sentry/nextjs";
 
 export const dynamic = "force-dynamic";
 
-// Default to 'mainnet' so misconfigured deployments fail closed, not open
-const NETWORK = process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim() ?? "mainnet";
+// Canonical env var first, legacy fallback; undefined = non-devnet (fail-closed)
+const NETWORK =
+  process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim() ??
+  process.env.NEXT_PUBLIC_SOLANA_NETWORK?.trim();
 const AIRDROP_USD_VALUE = 500; // $500 worth of tokens
 // ORACLE_BRIDGE_URL removed — unreachable from Vercel serverless.
 // Price fetching uses DexScreener API directly via fetchTokenInfo().
@@ -50,7 +53,29 @@ interface DexScreenerToken {
   logoUrl?: string;
 }
 
-/** Fetch token metadata and price from DexScreener */
+/** NAME-VALIDATION-001: Maximum length constraints for token metadata fields */
+const MAX_TOKEN_NAME_LEN = 255;
+const MAX_TOKEN_SYMBOL_LEN = 20;
+
+/**
+ * Sanitizes token name to ensure it doesn't exceed max length.
+ * NAME-VALIDATION-001: Prevents buffer overflow or database constraint violations.
+ */
+function sanitizeTokenName(name: string): string {
+  if (!name || typeof name !== 'string') return 'Unknown';
+  return name.slice(0, MAX_TOKEN_NAME_LEN).trim() || 'Unknown';
+}
+
+/**
+ * Sanitizes token symbol to ensure it doesn't exceed max length.
+ * Keeps consistency with name validation.
+ */
+function sanitizeTokenSymbol(symbol: string): string {
+  if (!symbol || typeof symbol !== 'string') return '???';
+  return symbol.slice(0, MAX_TOKEN_SYMBOL_LEN).trim() || '???';
+}
+
+/** Fetch token metadata and price from DexScreener, with DEXSCREENER-001 validation */
 async function fetchTokenInfo(ca: string): Promise<DexScreenerToken | null> {
   try {
     const resp = await fetch(
@@ -59,29 +84,22 @@ async function fetchTokenInfo(ca: string): Promise<DexScreenerToken | null> {
     );
     if (!resp.ok) return null;
     const json = await resp.json();
-    const pairs = json.pairs as Array<{
-      baseToken?: { name?: string; symbol?: string };
-      priceUsd?: string;
-      liquidity?: { usd?: number };
-      info?: { imageUrl?: string };
-    }>[] | undefined;
+    const pairs = json.pairs as unknown;
 
-    if (!pairs || pairs.length === 0) return null;
+    // DEXSCREENER-001: Validate external API response
+    const validated = validateDexScreenerResponse(pairs);
+    if (!validated) return null;
 
-    // Sort by liquidity, pick best
-    const sorted = [...pairs].sort(
-      (a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0),
-    );
-    const best = sorted[0] as any;
-    const price = parseFloat(best.priceUsd ?? "0");
-    if (price <= 0) return null;
+    // Extract price from best pair (validate separately)
+    if (!Array.isArray(json.pairs) || json.pairs.length === 0) {
+      return null;
+    }
+    const rawPrice = parseFloat(json.pairs[0]?.priceUsd ?? "0");
+    if (rawPrice <= 0) return null;
 
     return {
-      name: best.baseToken?.name ?? `Token ${ca.slice(0, 6)}`,
-      symbol: best.baseToken?.symbol ?? ca.slice(0, 4).toUpperCase(),
-      decimals: 6, // Default to 6 for devnet mirror (simplifies math)
-      priceUsd: price,
-      logoUrl: best.info?.imageUrl,
+      ...validated,
+      priceUsd: rawPrice,
     };
   } catch {
     return null;
@@ -143,7 +161,7 @@ export async function POST(req: NextRequest) {
     // Check if we already have a devnet mint for this CA
     const supabase = getServiceClient();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: existing } = await (supabase as any)
+    const { data: existing } = await supabase
       .from("devnet_mints")
       .select("devnet_mint")
       .eq("mainnet_ca", mainnetCA)
@@ -181,6 +199,11 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+
+    // NAME-VALIDATION-001: Sanitize token name and symbol before any usage.
+    // This prevents buffer overflow, database constraint violations, and XSS-like issues.
+    tokenInfo.name = sanitizeTokenName(tokenInfo.name);
+    tokenInfo.symbol = sanitizeTokenSymbol(tokenInfo.symbol);
 
     const cfg = getConfig();
     const connection = new Connection(cfg.rpcUrl, "confirmed");
@@ -325,7 +348,7 @@ export async function POST(req: NextRequest) {
     // Store in DB — INSERT-as-gate: devnet_mints has UNIQUE(mainnet_ca).
     // Under concurrent requests, the race loser gets Postgres 23505.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { error: insertErr } = await (supabase as any).from("devnet_mints").insert({
+    const { error: insertErr } = await supabase.from("devnet_mints").insert({
       mainnet_ca: mainnetCA,
       devnet_mint: devnetMint,
       market_address: marketAddress ?? null,
@@ -344,7 +367,7 @@ export async function POST(req: NextRequest) {
         `devnet-mint-token: TOCTOU race for ${mainnetCA} — orphaned mint ${devnetMint}, fetching winner`,
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: winner } = await (supabase as any)
+      const { data: winner } = await supabase
         .from("devnet_mints")
         .select("devnet_mint")
         .eq("mainnet_ca", mainnetCA)
@@ -371,15 +394,12 @@ export async function POST(req: NextRequest) {
     // The airdrop route looks up mint_address in the markets table, not devnet_mints.
     // Best-effort: if this fails, airdrop can still fall back to devnet_mints.
     if (marketAddress) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { error: upsertErr } = await (supabase as any).from("markets").upsert(
-        {
-          slab_address: marketAddress,
+      const { error: upsertErr } = await supabase.from("markets")
+        .update({
           mint_address: devnetMint,
           symbol: tokenInfo.symbol,
-        },
-        { onConflict: "slab_address" },
-      );
+        })
+        .eq("slab_address", marketAddress);
       if (upsertErr) {
         console.warn("devnet-mint-token: markets upsert failed (non-fatal):", upsertErr.message);
       }

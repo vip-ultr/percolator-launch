@@ -75,7 +75,8 @@ export function useAutoFund() {
   useEffect(() => {
     if (!connected || !publicKey) return;
 
-    const isDevnet = process.env.NEXT_PUBLIC_SOLANA_NETWORK === "devnet";
+    const isDevnet =
+      (process.env.NEXT_PUBLIC_DEFAULT_NETWORK ?? process.env.NEXT_PUBLIC_SOLANA_NETWORK) === "devnet";
     if (!isDevnet) return;
 
     const walletAddr = publicKey.toBase58();

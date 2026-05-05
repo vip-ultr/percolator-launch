@@ -409,7 +409,8 @@ const DevnetMintContent: FC = () => {
         const mintPk = new PublicKey(existingMint);
         const mintInfo = await connection.getParsedAccountInfo(mintPk);
         if (!mintInfo.value) { if (!cancelled) { setMintAuthError("Mint not found on devnet"); setCheckingMintAuth(false); } return; }
-        const parsed = (mintInfo.value.data as any)?.parsed;
+        const data = mintInfo.value.data;
+        const parsed = "parsed" in data ? data.parsed : undefined;
         if (!parsed || parsed.type !== "mint") { if (!cancelled) { setMintAuthError("Not a valid SPL token mint"); setCheckingMintAuth(false); } return; }
         const authority = parsed.info.mintAuthority;
         if (!authority) {
@@ -436,7 +437,8 @@ const DevnetMintContent: FC = () => {
       const recipientPk = new PublicKey(recipient);
       const mintInfo = await connection.getParsedAccountInfo(mintPk);
       if (!mintInfo.value) throw new Error("Mint not found");
-      const parsedMint = (mintInfo.value.data as any)?.parsed;
+      const mintData = mintInfo.value.data;
+      const parsedMint = "parsed" in mintData ? mintData.parsed : undefined;
       if (!parsedMint || parsedMint.type !== "mint") throw new Error("Not a valid mint");
       const dec = parsedMint.info.decimals;
 

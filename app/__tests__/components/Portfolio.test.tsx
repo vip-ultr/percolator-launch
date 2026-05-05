@@ -18,7 +18,7 @@ import { useWalletCompat } from "@/hooks/useWalletCompat";
 import { usePortfolio } from "@/hooks/usePortfolio";
 import { useMultiTokenMeta } from "@/hooks/useMultiTokenMeta";
 import { PublicKey } from "@solana/web3.js";
-import { AccountKind } from "@percolator/sdk";
+import { AccountKind } from "@percolatorct/sdk";
 
 // Mock Next.js
 vi.mock("next/link", () => ({
@@ -81,12 +81,12 @@ describe("Portfolio Component Tests", () => {
 
   describe("PORT-001: Display positions with null PnL (CRITICAL)", () => {
     it("should display 0.00 for null PnL without crashing", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [
           {
             slabAddress: "test-slab-123",
@@ -107,6 +107,13 @@ describe("Portfolio Component Tests", () => {
               },
               engine: {},
             },
+            // Enriched fields from usePortfolio
+            unrealizedPnl: 0n,
+            oraclePriceE6: 100000000n,
+            pnlPercent: 0,
+            leverage: 5,
+            liquidationPriceE6: 80000000n,
+            liquidationDistancePct: 100,
           },
         ],
         totalPnl: 0n,
@@ -115,7 +122,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -126,12 +133,12 @@ describe("Portfolio Component Tests", () => {
     });
 
     it("should handle undefined PnL", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [
           {
             slabAddress: "test-slab-456",
@@ -152,6 +159,13 @@ describe("Portfolio Component Tests", () => {
               },
               engine: {},
             },
+            // Enriched fields from usePortfolio
+            unrealizedPnl: 0n,
+            oraclePriceE6: 95000000n,
+            pnlPercent: 0,
+            leverage: 1.5,
+            liquidationPriceE6: 110000000n,
+            liquidationDistancePct: 100,
           },
         ],
         totalPnl: 0n,
@@ -160,7 +174,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "USDC", decimals: 6 }]])
       );
 
@@ -171,12 +185,12 @@ describe("Portfolio Component Tests", () => {
     });
 
     it("should correctly display negative PnL", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [
           {
             slabAddress: "test-slab-789",
@@ -197,6 +211,13 @@ describe("Portfolio Component Tests", () => {
               },
               engine: {},
             },
+            // Enriched fields from usePortfolio
+            unrealizedPnl: -500000n,
+            oraclePriceE6: 100000000n,
+            pnlPercent: -50,
+            leverage: 5,
+            liquidationPriceE6: 80000000n,
+            liquidationDistancePct: 20,
           },
         ],
         totalPnl: -500000n,
@@ -205,7 +226,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -220,12 +241,12 @@ describe("Portfolio Component Tests", () => {
     it("should call refresh function when refresh button is clicked", async () => {
       const mockRefresh = vi.fn();
 
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -233,7 +254,7 @@ describe("Portfolio Component Tests", () => {
         refresh: mockRefresh,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -246,12 +267,12 @@ describe("Portfolio Component Tests", () => {
     it("should disable refresh button while loading", () => {
       const mockRefresh = vi.fn();
 
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -259,7 +280,7 @@ describe("Portfolio Component Tests", () => {
         refresh: mockRefresh,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -272,12 +293,12 @@ describe("Portfolio Component Tests", () => {
     it("should not manage its own refresh interval (delegated to usePortfolio hook)", async () => {
       const mockRefresh = vi.fn();
 
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -286,7 +307,7 @@ describe("Portfolio Component Tests", () => {
         refresh: mockRefresh,
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -299,12 +320,12 @@ describe("Portfolio Component Tests", () => {
 
   describe("PORT-004: Token metadata loading", () => {
     it("should show skeleton while token metadata is loading", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [
           {
             slabAddress: "test-slab",
@@ -325,6 +346,12 @@ describe("Portfolio Component Tests", () => {
               },
               engine: {},
             },
+            unrealizedPnl: 0n,
+            oraclePriceE6: 100000000n,
+            pnlPercent: 0,
+            leverage: 5,
+            liquidationPriceE6: 80000000n,
+            liquidationDistancePct: 100,
           },
         ],
         totalPnl: 0n,
@@ -334,7 +361,7 @@ describe("Portfolio Component Tests", () => {
       });
 
       // Empty map = metadata still loading
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -349,12 +376,12 @@ describe("Portfolio Component Tests", () => {
     });
 
     it("should display position after metadata loads", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [
           {
             slabAddress: "test-slab-abc",
@@ -375,6 +402,12 @@ describe("Portfolio Component Tests", () => {
               },
               engine: {},
             },
+            unrealizedPnl: 0n,
+            oraclePriceE6: 100000000n,
+            pnlPercent: 0,
+            leverage: 5,
+            liquidationPriceE6: 80000000n,
+            liquidationDistancePct: 100,
           },
         ],
         totalPnl: 0n,
@@ -384,7 +417,7 @@ describe("Portfolio Component Tests", () => {
       });
 
       // Metadata loaded
-      (useMultiTokenMeta as any).mockReturnValue(
+      vi.mocked(useMultiTokenMeta).mockReturnValue(
         new Map([[mockPublicKey.toBase58(), { symbol: "SOL", decimals: 6 }]])
       );
 
@@ -397,12 +430,12 @@ describe("Portfolio Component Tests", () => {
 
   describe("PORT-005: Empty portfolio state", () => {
     it('should show "No positions yet" message when user has no positions', () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -410,7 +443,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -419,12 +452,12 @@ describe("Portfolio Component Tests", () => {
     });
 
     it("should show Browse Markets button when empty", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: true,
         publicKey: mockPublicKey,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -432,7 +465,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 
@@ -442,12 +475,12 @@ describe("Portfolio Component Tests", () => {
     });
 
     it("should show wallet connection prompt when not connected", () => {
-      (useWalletCompat as any).mockReturnValue({
+      vi.mocked(useWalletCompat).mockReturnValue({
         connected: false,
         publicKey: null,
       });
 
-      (usePortfolio as any).mockReturnValue({
+      vi.mocked(usePortfolio).mockReturnValue({
         positions: [],
         totalPnl: 0n,
         totalDeposited: 0n,
@@ -455,7 +488,7 @@ describe("Portfolio Component Tests", () => {
         refresh: vi.fn(),
       });
 
-      (useMultiTokenMeta as any).mockReturnValue(new Map());
+      vi.mocked(useMultiTokenMeta).mockReturnValue(new Map());
 
       render(<PortfolioPage />);
 

@@ -24,8 +24,8 @@ vi.mock("@/lib/supabase", () => ({
   getServiceClient: () => mockSupabase,
 }));
 
-// Isolate rate limiter between tests by resetting modules
-import { GET, rateMap } from "@/app/api/trader/[wallet]/stats/route";
+// Rate limiter eviction is now tested via lib/memory-rate-limit.test.ts.
+import { GET } from "@/app/api/trader/[wallet]/stats/route";
 import { NextRequest } from "next/server";
 
 const VALID_WALLET = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
@@ -53,31 +53,8 @@ describe("GET /api/trader/:wallet/stats", () => {
     mockSupabase.limit.mockResolvedValue({ data: [], error: null });
   });
 
-  // STATS-006: rateMap eviction prevents unbounded memory growth (issue #833)
-  it("evicts expired rateMap entries when threshold is exceeded", async () => {
-    // Pre-populate rateMap with 501 expired entries (resetAt in the past).
-    rateMap.clear();
-    const past = Date.now() - 120_000; // 2 minutes ago — well outside the 60s window
-    for (let i = 0; i < 501; i++) {
-      rateMap.set(`10.0.${Math.floor(i / 256)}.${i % 256}`, { count: 1, resetAt: past });
-    }
-    expect(rateMap.size).toBe(501);
-
-    // A request from a new IP should trigger eviction and still succeed.
-    mockSupabase.limit.mockResolvedValueOnce({ data: [], error: null });
-    const req = new NextRequest(`http://localhost/api/trader/${VALID_WALLET}/stats`, {
-      headers: { "x-forwarded-for": "99.99.99.99" },
-    });
-    const res = await GET(req, { params: Promise.resolve({ wallet: VALID_WALLET }) });
-    expect(res.status).toBe(200);
-
-    // All 501 expired entries + the new live entry should have been swept, leaving only the new one.
-    expect(rateMap.size).toBe(1);
-    expect(rateMap.has("99.99.99.99")).toBe(true);
-    expect(rateMap.get("99.99.99.99")?.count).toBe(1);
-
-    rateMap.clear();
-  });
+  // STATS-006: rateMap eviction is now tested in lib/memory-rate-limit.test.ts.
+  // The shared rate limiter factory handles eviction internally.
 
   // STATS-003: Invalid wallet rejected
   it("returns 400 for invalid wallet address", async () => {

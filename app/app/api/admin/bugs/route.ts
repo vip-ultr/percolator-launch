@@ -31,7 +31,7 @@ export async function GET() {
   const sb = getServiceClient();
 
   // 3. Fetch all bug_reports columns using service role (bypasses column GRANT restrictions)
-  const { data, error: fetchError } = await (sb as any)
+  const { data, error: fetchError } = await sb
     .from("bug_reports")
     .select("*")
     .order("created_at", { ascending: false })
@@ -74,7 +74,7 @@ export async function PATCH(req: NextRequest) {
   // Ensure updated_at is refreshed
   updates.updated_at = new Date().toISOString();
 
-  const { data, error: updateError } = await (sb as any)
+  const { data, error: updateError } = await sb
     .from("bug_reports")
     .update(updates)
     .eq("id", id)

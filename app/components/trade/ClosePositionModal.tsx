@@ -12,7 +12,10 @@ interface ClosePositionModalProps {
   entryPrice: bigint;
   currentPrice: bigint;
   capital: bigint;
+  /** Index asset symbol for position size (e.g. "SOL") */
   symbol: string;
+  /** Collateral symbol for PnL/capital amounts (e.g. "USDC"). Falls back to symbol. */
+  collateralSymbol?: string;
   decimals: number;
   priceUsd: number | null;
   isLong: boolean;
@@ -35,6 +38,7 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
   currentPrice,
   capital,
   symbol,
+  collateralSymbol,
   decimals,
   priceUsd,
   isLong,
@@ -47,6 +51,10 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
   const modalRef = useRef<HTMLDivElement>(null);
   const prefersReduced = usePrefersReducedMotion();
   const [percent, setPercent] = useState(100);
+
+  // Ref-based callback to prevent WS price ticks from replaying the GSAP animation
+  const onCancelRef = useRef(onCancel);
+  onCancelRef.current = onCancel;
 
   useEffect(() => {
     const overlay = overlayRef.current;
@@ -71,16 +79,18 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
     }
 
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") onCancelRef.current();
     };
     document.addEventListener("keydown", handleEscape);
     return () => document.removeEventListener("keydown", handleEscape);
-  }, [onCancel, prefersReduced]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefersReduced]);
 
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === e.currentTarget) onCancel();
   };
 
+  const colSym = collateralSymbol ?? symbol;
   const absPosition = abs(positionSize);
 
   const preview = useMemo(() => {
@@ -91,7 +101,7 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
 
     // Compute PnL on the close portion
     const closePositionSigned = isLong ? closeAbs : -closeAbs;
-    const pnl = currentPrice > 0n
+    const pnl = currentPrice > 0n && entryPrice > 0n
       ? computeMarkPnl(closePositionSigned, entryPrice, currentPrice)
       : 0n;
 
@@ -127,12 +137,15 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
     >
       <div
         ref={modalRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="close-position-title"
         className="relative w-full max-w-md rounded-none border border-[var(--border)] bg-[var(--bg)] p-6 shadow-2xl"
       style={{ opacity: 0 }}
       >
         {/* Header */}
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-sm font-bold uppercase tracking-[0.15em] text-[var(--text)]">
+          <h2 id="close-position-title" className="text-sm font-bold uppercase tracking-[0.15em] text-[var(--text)]">
             Close Position
           </h2>
           <button
@@ -214,7 +227,7 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
             <span className="text-[var(--text-dim)]">Est. PnL:</span>
             <span className={`font-mono font-medium ${pnlColor}`}>
               {preview.pnl > 0n ? "+" : preview.pnl < 0n ? "-" : ""}
-              {formatTokenAmount(abs(preview.pnl), decimals)} {symbol}
+              {formatTokenAmount(abs(preview.pnl), decimals)} {colSym}
               {preview.pnlUsd !== null && (
                 <span className="ml-1 text-[10px]">
                   ({preview.pnlUsd >= 0 ? "+" : ""}${Math.abs(preview.pnlUsd).toFixed(2)})
@@ -225,7 +238,7 @@ export const ClosePositionModal: FC<ClosePositionModalProps> = ({
           <div className="flex justify-between">
             <span className="text-[var(--text-dim)]">Est. Receive:</span>
             <span className="font-mono font-medium text-[var(--text)]">
-              ~{formatTokenAmount(preview.receive, decimals)} {symbol}
+              ~{formatTokenAmount(preview.receive, decimals)} {colSym}
             </span>
           </div>
         </div>

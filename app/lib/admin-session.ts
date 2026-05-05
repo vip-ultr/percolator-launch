@@ -69,8 +69,7 @@ export async function requireAdminSession(): Promise<AdminSessionResult> {
   const email = normalizeEmail(user.email);
 
   const sb = getServiceClient();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { data: adminRow } = await (sb as any)
+  const { data: adminRow } = await sb
     .from("admin_users")
     .select("id")
     .eq("email", email)

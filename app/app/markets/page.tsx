@@ -8,13 +8,12 @@ import { useMarketDiscovery } from "@/hooks/useMarketDiscovery";
 import { computeMarketHealth, computeMarketHealthFromStats, sanitizeOnChainValue, isSentinelValue } from "@/lib/health";
 import { HealthBadge } from "@/components/market/HealthBadge";
 import { formatTokenAmount } from "@/lib/format";
-import { getSupabase } from "@/lib/supabase";
 import { isSaneMarketValue, isZombieMarket } from "@/lib/activeMarketFilter";
 import { BLOCKED_SLAB_ADDRESSES } from "@/lib/blocklist";
 import type { Database } from "@/lib/database.types";
 
 type MarketWithStats = Database['public']['Views']['markets_with_stats']['Row'];
-import type { DiscoveredMarket } from "@percolator/sdk";
+import type { DiscoveredMarket } from "@percolatorct/sdk";
 import { PublicKey } from "@solana/web3.js";
 import { ShimmerSkeleton } from "@/components/ui/ShimmerSkeleton";
 import { ScrollReveal } from "@/components/ui/ScrollReveal";
@@ -65,6 +64,48 @@ interface MergedMarket {
   isAdminOracle: boolean;
   onChain: DiscoveredMarket | null;  // null for Supabase-only markets not yet discovered on-chain
   supabase: MarketWithStats | null;
+}
+
+function isPlaceholderMarketSymbol(sym: string | null | undefined, addresses: Array<string | null | undefined>): boolean {
+  if (!sym) return true;
+  const clean = sym.trim();
+  if (!clean) return true;
+  if (/^[0-9a-fA-F]{8}$/.test(clean)) return true;
+  if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(clean)) return true;
+  return addresses.some((addr) => !!addr && addr.startsWith(clean));
+}
+
+function resolveMarketLogoMintAddress(m: MergedMarket): string | null {
+  return m.supabase?.mainnet_ca || m.mintAddress || null;
+}
+
+function resolveMarketDisplaySymbol(m: MergedMarket): string | null {
+  const addresses = [m.slabAddress, m.mintAddress, m.supabase?.mainnet_ca];
+  for (const candidate of [m.supabase?.symbol, m.symbol]) {
+    const clean = candidate?.trim();
+    if (!clean || clean.length > 10) continue;
+    if (!isPlaceholderMarketSymbol(clean, addresses)) return clean;
+  }
+  return null;
+}
+
+function isPlaceholderMarketName(name: string | null | undefined, addresses: Array<string | null | undefined>): boolean {
+  if (!name) return true;
+  const clean = name.trim();
+  if (!clean) return true;
+  if (/^Market [A-Za-z0-9]{6,}$/.test(clean)) return true;
+  if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(clean)) return true;
+  return addresses.some((addr) => !!addr && clean.length <= 8 && addr.startsWith(clean));
+}
+
+function resolveMarketDisplayName(m: MergedMarket): string | null {
+  const addresses = [m.slabAddress, m.mintAddress, m.supabase?.mainnet_ca];
+  for (const candidate of [m.supabase?.name, m.name]) {
+    const clean = candidate?.trim();
+    if (!clean) continue;
+    if (!isPlaceholderMarketName(clean, addresses)) return clean;
+  }
+  return null;
 }
 
 /* ─── Mock markets for local design testing ─── */
@@ -299,13 +340,14 @@ function MarketsPageInner() {
       const q = debouncedSearch.toLowerCase();
       const isAddressSearch = q.length >= 8;
       list = list.filter((m) => {
-        const onChainMeta = tokenMetaMap.get(m.mintAddress);
-        return onChainMeta?.symbol?.toLowerCase().includes(q) ||
-          onChainMeta?.name?.toLowerCase().includes(q) ||
-          m.supabase?.name?.toLowerCase().includes(q) ||
-          m.supabase?.symbol?.toLowerCase().includes(q) ||
+        const displaySymbol = resolveMarketDisplaySymbol(m)?.toLowerCase();
+        const displayName = resolveMarketDisplayName(m)?.toLowerCase();
+        const marketMint = resolveMarketLogoMintAddress(m)?.toLowerCase();
+        return displaySymbol?.includes(q) ||
+          displayName?.includes(q) ||
           (isAddressSearch && m.slabAddress.toLowerCase().includes(q)) ||
-          (isAddressSearch && m.mintAddress.toLowerCase().includes(q));
+          (isAddressSearch && m.mintAddress.toLowerCase().includes(q)) ||
+          (isAddressSearch && marketMint?.includes(q));
       });
     }
     // Leverage filter — exclude markets with invalid leverage (0, NaN, Infinity)
@@ -919,6 +961,12 @@ function MarketsPageInner() {
                         ? formatNum(Math.round((Number(volume24hRaw) / tokenDivisor) * lastPrice * 100) / 100)
                         : formatTokenAmount(volume24hRaw, mintDecimals, 2))
                     : null;
+                  // The slab collateral mint is often USDC. Pair identity must come
+                  // from market metadata, otherwise SOL/USDC perps render as USDC/USD.
+                  const displaySymbol = resolveMarketDisplaySymbol(m);
+                  const displayName = resolveMarketDisplayName(m);
+                  const logoMintAddress = resolveMarketLogoMintAddress(m);
+                  const subtitleAddress = logoMintAddress || m.mintAddress;
 
                   return (
                     <Link
@@ -934,37 +982,12 @@ function MarketsPageInner() {
                         <div className="flex items-center gap-2">
                           <MarketLogo
                             logoUrl={m.supabase?.logo_url}
-                            mintAddress={m.mintAddress}
-                            symbol={
-                              // GH#1544: prefer on-chain symbol; fall back to Supabase symbol
-                              // so anonymous markets show a meaningful abbreviation instead of "?"
-                              // Use || (not ??) so empty-string on-chain symbols fall through to
-                              // the Supabase fallback — CodeRabbit review fix.
-                              tokenMetaMap.get(m.mintAddress)?.symbol ||
-                              m.supabase?.symbol ||
-                              undefined
-                            }
+                            mintAddress={logoMintAddress}
+                            symbol={displaySymbol ?? undefined}
                             size="sm"
                           />
                           <span className="font-semibold text-[var(--text)] text-sm">
-                            {(() => {
-                              // Helper: detect if a symbol is a truncated address (auto-registered placeholder)
-                              const isPlaceholderSymbol = (sym: string | null | undefined, mint: string): boolean => {
-                                if (!sym) return true;
-                                // Reject if it's the first N chars of the mint address (StatsCollector default)
-                                if (mint.startsWith(sym)) return true;
-                                // Reject pure hex-like strings (8 chars)
-                                if (/^[0-9a-fA-F]{8}$/.test(sym)) return true;
-                                // Reject if it looks like a truncated address with ellipsis
-                                if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(sym)) return true;
-                                return false;
-                              };
-                              const onChainSym = tokenMetaMap.get(m.mintAddress)?.symbol;
-                              const supabaseSym = m.supabase?.symbol;
-                              const sym = (!isPlaceholderSymbol(onChainSym, m.mintAddress) ? onChainSym : null)
-                                || (!isPlaceholderSymbol(supabaseSym, m.mintAddress) && supabaseSym && supabaseSym.length <= 10 ? supabaseSym : null);
-                              return sym ? `${sym}/USD` : shortenAddress(m.slabAddress);
-                            })()}
+                            {displaySymbol ? `${displaySymbol}/USD` : shortenAddress(m.slabAddress)}
                           </span>
                           {m.isAdminOracle && (
                             <span className="border border-[var(--text-dim)]/30 bg-[var(--text-dim)]/[0.08] px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-[var(--text-dim)]">manual</span>
@@ -981,22 +1004,7 @@ function MarketsPageInner() {
                           )}
                         </div>
                         <div className="text-[10px] text-[var(--text-dim)]" style={{ fontFamily: "var(--font-mono)" }}>
-                          {(() => {
-                            const onChainName = tokenMetaMap.get(m.mintAddress)?.name;
-                            const supabaseName = m.supabase?.name;
-                            // Filter out placeholder names like "Market XXXXXXXX"
-                            const isPlaceholderName = (n: string | null | undefined): boolean => {
-                              if (!n) return true;
-                              if (/^Market [A-Za-z0-9]{6,}$/.test(n)) return true;
-                              if (n.length <= 8 && m.mintAddress.startsWith(n)) return true;
-                              // Filter truncated addresses used as names
-                              if (/^[A-Za-z0-9]{3,6}\.\.\.[A-Za-z0-9]{3,6}$/.test(n)) return true;
-                              return false;
-                            };
-                            const name = (!isPlaceholderName(onChainName) ? onChainName : null)
-                              || (!isPlaceholderName(supabaseName) ? supabaseName : null);
-                            return name ? `${name} · ${shortenAddress(m.mintAddress)}` : shortenAddress(m.mintAddress);
-                          })()}
+                          {displayName ? `${displayName} · ${shortenAddress(subtitleAddress)}` : shortenAddress(subtitleAddress)}
                         </div>
                       </div>
                       <div className="text-right truncate">

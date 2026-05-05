@@ -214,7 +214,7 @@ export function useEarnStats() {
           const collDivisor = 10 ** collDecimals;
           // OI values are stored in collateral micro-units — convert to human units
           const totalOI = isSentinel(totalOIRaw) ? 0 : totalOIRaw / collDivisor;
-          const maxLeverage = m.max_leverage ?? 10;
+          const maxLeverage = m.max_leverage || 10;
           // Fix GH#1204: use vault_balance (actual on-chain deposits) not lp_collateral
           // (bootstrap config constant). lp_collateral = 10^11 for NNOB-PERP at 6 decimals
           // = $100K TVL even when vault has zero actual deposits.

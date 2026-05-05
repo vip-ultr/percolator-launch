@@ -1,7 +1,7 @@
 "use client";
 
 import { FC } from "react";
-import { SLAB_TIERS, type SlabTierKey } from "@percolator/sdk";
+import { SLAB_TIERS, type SlabTierKey } from "@percolatorct/sdk";
 
 interface SlabTierPickerProps {
   value: SlabTierKey;
@@ -9,15 +9,15 @@ interface SlabTierPickerProps {
 }
 
 const TIER_COSTS: Record<SlabTierKey, string> = {
-  small: "~0.45 SOL",
+  small:  "~0.45 SOL",
   medium: "~1.8 SOL",
-  large: "~7 SOL",
+  large:  "~7 SOL",
 };
 
 const TIER_DESCRIPTIONS: Record<SlabTierKey, string> = {
-  small: "Low liquidity depth",
+  small:  "Low liquidity depth",
   medium: "Standard",
-  large: "Deep orderbook",
+  large:  "Deep orderbook",
 };
 
 /**

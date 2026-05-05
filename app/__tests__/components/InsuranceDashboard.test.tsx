@@ -23,7 +23,7 @@ describe("InsuranceDashboard Component", () => {
   });
 
   it("should render loading state initially", () => {
-    (global.fetch as any).mockImplementation(
+    vi.mocked(global.fetch).mockImplementation(
       () => new Promise(() => {})
     );
 
@@ -45,7 +45,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -71,7 +71,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -95,7 +95,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -119,7 +119,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -150,7 +150,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -177,7 +177,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -209,7 +209,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValueOnce({
+    vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: true,
       json: async () => mockInsuranceData,
     });
@@ -222,7 +222,7 @@ describe("InsuranceDashboard Component", () => {
   });
 
   it("should handle API errors gracefully", async () => {
-    (global.fetch as any).mockRejectedValueOnce(
+    vi.mocked(global.fetch).mockRejectedValueOnce(
       new Error("Network error")
     );
 
@@ -248,7 +248,7 @@ describe("InsuranceDashboard Component", () => {
       ],
     };
 
-    (global.fetch as any).mockResolvedValue({
+    vi.mocked(global.fetch).mockResolvedValue({
       ok: true,
       json: async () => mockInsuranceData,
     });
