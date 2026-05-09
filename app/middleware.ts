@@ -220,7 +220,78 @@ const MAINNET_BETA_BLOCKED_PATHS = [
   "/devnet-mint", "/faucet", "/openclaw", "/pitch",
 ];
 
+// ── Hostname routing (waitlist pivot 2026-05-08) ─────────────────────────────
+// The Vercel project hosts three logical surfaces on the same Next.js app:
+//   - mainnet.percolatorlaunch.com  : full trading frontend (existing app)
+//   - percolator.trade              : waitlist landing + /pitch only
+//   - percolatorlaunch.com (apex)   : 301 redirect to percolator.trade
+//
+// This block runs FIRST, before all other middleware logic, so non-waitlist
+// hostnames continue to behave exactly as before.
+const WAITLIST_HOSTS = new Set(["percolator.trade"]);
+const REDIRECT_HOSTS = new Set([
+  // www.percolator.trade canonicalizes to apex (SEO)
+  "www.percolator.trade",
+  "percolatorlaunch.com",
+  "www.percolatorlaunch.com",
+]);
+// Paths that ARE allowed on the waitlist host (percolator.trade). Anything else
+// → redirect to /waitlist. Trading-product surfaces (markets, dashboard,
+// portfolio, wallet, trade, create, stake, devnet-mint, faucet) stay blocked
+// here — they continue to live on mainnet.percolatorlaunch.com.
+const WAITLIST_HOST_ALLOWED_PREFIXES = [
+  "/waitlist",
+  "/pitch",        // investor-facing deck (still accessible, just not linked from nav)
+  "/guide",        // developer guide
+  "/developers",
+  "/join",         // community/applications
+  "/report-bug",
+  "/bugs",         // community-submitted bug list
+  "/agents",
+  "/leaderboard",
+  "/openclaw",
+];
+function isAllowedOnWaitlistHost(pathname: string): boolean {
+  if (pathname === "/") return true;
+  if (pathname.startsWith("/api/")) return true;
+  if (pathname.startsWith("/_next/")) return true;
+  if (/\.(?:svg|png|jpg|jpeg|gif|webp|ico|css|js|woff2?|ttf|map)$/i.test(pathname)) return true;
+  for (const p of WAITLIST_HOST_ALLOWED_PREFIXES) {
+    if (pathname === p || pathname.startsWith(p + "/")) return true;
+  }
+  return false;
+}
+
 export async function middleware(request: NextRequest) {
+  // ── Hostname routing ───────────────────────────────────────────────────────
+  const host = (request.headers.get("host") ?? "").toLowerCase().split(":")[0];
+
+  // Apex/www redirect: percolatorlaunch.com → percolator.trade (path-preserving 301)
+  if (REDIRECT_HOSTS.has(host)) {
+    const target = new URL(
+      request.nextUrl.pathname + request.nextUrl.search,
+      "https://percolator.trade",
+    );
+    return NextResponse.redirect(target, { status: 301 });
+  }
+
+  // Waitlist host: rewrite root to /waitlist, redirect everything non-allowed to /waitlist
+  if (WAITLIST_HOSTS.has(host)) {
+    const path = request.nextUrl.pathname;
+    if (path === "/") {
+      const url = request.nextUrl.clone();
+      url.pathname = "/waitlist";
+      return NextResponse.rewrite(url);
+    }
+    if (!isAllowedOnWaitlistHost(path)) {
+      const url = request.nextUrl.clone();
+      url.pathname = "/waitlist";
+      url.search = "";
+      return NextResponse.redirect(url, { status: 302 });
+    }
+    // Allowed path on waitlist host — fall through to existing middleware logic
+  }
+
   // ── Mainnet beta: block pages not available yet ────────────────────────────
   const isMainnet = process.env.NEXT_PUBLIC_DEFAULT_NETWORK?.trim() === "mainnet";
   if (isMainnet) {
